@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  ai-lesson-builder:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - AI_PROVIDER=${AI_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}
+      - DEBUG=${DEBUG:-false}
+      - STREAM_TIMEOUT=${STREAM_TIMEOUT:-60}
+    volumes:
+      - ./app:/app/app:ro  # Mount for development (read-only)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

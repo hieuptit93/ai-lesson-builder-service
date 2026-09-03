@@ -74,3 +74,5 @@ ENV/
 # Runtime artifacts
 server.log
 server.pid
+deploy/langfuse/.env
+.env.bak*

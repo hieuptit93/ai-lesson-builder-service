@@ -4,6 +4,7 @@ import time
 from datetime import date, datetime
 
 import structlog
+from langfuse import observe
 
 from app.domains.profile.domain.entities import ChildProfile, UserProfile
 from app.domains.profile.infrastructure.profile_client import ProfileClient, ProfileClientError
@@ -55,6 +56,7 @@ class ProfileService:
         )
         return None
 
+    @observe(name="profile_fetch", capture_input=True, capture_output=True)
     async def fetch_profile(
         self,
         profile_id: str,

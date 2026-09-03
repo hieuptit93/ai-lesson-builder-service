@@ -1,6 +1,7 @@
 import time
 
 import structlog
+from langfuse import observe
 
 from app.domains.memory.domain.entities import MemoryFact, UserMemory
 from app.domains.memory.infrastructure.mem0_client import Mem0Client
@@ -12,6 +13,7 @@ class MemoryService:
     def __init__(self, mem0_client: Mem0Client):
         self._client = mem0_client
 
+    @observe(name="memory_fetch", capture_input=True, capture_output=True)
     async def fetch_user_memory(
         self,
         user_id: str,

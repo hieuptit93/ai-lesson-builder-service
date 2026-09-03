@@ -47,9 +47,10 @@ async def generate_lesson(
     )
 
     if body.stream:
-        # Use V3 flow (Option B): only 2 API calls (guardrail + vision)
+        # Streaming mode - 1 call optimization (~10s) with D-steps, mem0 included
+        # Note: expert_discussion_log will be empty (trade-off for speed)
         return StreamingResponse(
-            pipeline.stream_generate_v3(body, request_id=request_id, delay=settings.stream_delay_seconds),
+            pipeline.stream_generate_v3(body, request_id=request_id, delay=settings.stream_delay_seconds, use_full_prompt=True),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -58,8 +59,8 @@ async def generate_lesson(
             },
         )
 
-    # Use V3 flow (Option B): only 2 API calls (guardrail + vision)
-    result = await pipeline.generate_v3(body, request_id=request_id)
+    # Sync mode - use optimized V1 pipeline (7-8s)
+    result = await pipeline.generate(body, request_id=request_id)
     elapsed_ms = int((time.monotonic() - start_time) * 1000)
 
     logger.info(

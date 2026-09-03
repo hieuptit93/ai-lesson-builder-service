@@ -6,6 +6,7 @@ import time
 from collections.abc import AsyncGenerator
 
 import structlog
+from langfuse import observe
 
 from app.domains.lesson_generator.application.services.prompt_builder import (
     _TALK_AGENT_S0_S1,
@@ -97,6 +98,7 @@ class GeneratorService:
         self._adapter = adapter
         self._model_name = model_name
 
+    @observe(name="lesson_generation", capture_input=True, capture_output=True)
     async def generate_lesson(
         self,
         *,
@@ -161,6 +163,7 @@ class GeneratorService:
 
         return expert_log, lesson_plan
 
+    @observe(name="lesson_regeneration", capture_input=True, capture_output=True)
     async def generate_regenerate_lesson(
         self,
         *,

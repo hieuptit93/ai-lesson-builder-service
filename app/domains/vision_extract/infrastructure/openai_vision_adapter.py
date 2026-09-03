@@ -1,12 +1,237 @@
+import asyncio
 import base64
+import hashlib
+import io
 import json
+from collections.abc import AsyncGenerator
+from functools import lru_cache
 from typing import Any
 
 import httpx
 import structlog
+from langfuse import observe
 from openai import AsyncOpenAI
 
 logger = structlog.get_logger()
+
+# Image variants sent to OpenAI. Vision models bill by resolution tiles, so
+# oversized CDN images waste input tokens and upload time.
+_VISION_MAX_DIM = 1536   # full detail for extraction
+_GUARDRAIL_MAX_DIM = 768  # guardrail only detects unsafe content - low res is enough
+_JPEG_QUALITY = 80
+_CACHE_MAX_ENTRIES = 32   # bound the per-process cache (keyed by URL)
+
+# OpenAI caches the static prefix of a prompt automatically once it exceeds this
+# many tokens. Our extraction prompts are far longer, but the guardrail prompt
+# sits near the boundary - log when a call is too small to ever cache.
+_PROMPT_CACHE_MIN_TOKENS = 1024
+_CHARS_PER_TOKEN_ESTIMATE = 4  # rough: enough to spot a prompt that can't cache
+
+
+@lru_cache(maxsize=32)
+def _prompt_cache_key(prompt: str) -> str:
+    """Stable routing key for OpenAI's prompt cache.
+
+    Requests sharing a cache key are routed to the same backend, which raises
+    the hit rate for our handful of long static prompts. Keyed on the prompt
+    text only - images vary per request and are not part of the cached prefix.
+    """
+    return f"lesson-vision-{hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _warn_if_uncacheable(prompt: str, call: str) -> None:
+    """Log once-per-call when a prompt is too short for the prompt cache."""
+    if len(prompt) // _CHARS_PER_TOKEN_ESTIMATE < _PROMPT_CACHE_MIN_TOKENS:
+        logger.info(
+            "prompt_cache_unlikely",
+            call=call,
+            prompt_chars=len(prompt),
+            min_tokens_required=_PROMPT_CACHE_MIN_TOKENS,
+        )
+
+
+def _resize_image_sync(raw: bytes, max_dim: int) -> tuple[bytes, str]:
+    """Downscale image to max_dim on the long edge. Returns (bytes, mime).
+
+    Falls back to original bytes if Pillow can't decode (e.g. exotic format).
+    Runs in a thread via asyncio.to_thread - PIL is CPU-bound.
+    """
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        if max(img.size) <= max_dim:
+            return raw, Image.MIME.get(img.format or "", "image/jpeg")
+        img.thumbnail((max_dim, max_dim))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=_JPEG_QUALITY)
+        return out.getvalue(), "image/jpeg"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("image_resize_failed", error=str(exc))
+        return raw, "image/jpeg"
+
+
+class _LessonStreamScanner:
+    """Incrementally extracts complete lesson objects from a streamed JSON text.
+
+    The model streams the output_schema JSON: {..., "lessons": [ {...}, {...} ]}.
+    We locate the lessons array once, then emit each top-level object inside it
+    as soon as its braces balance (string/escape aware).
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_array = False
+        self._pos = 0           # scan cursor
+        self._depth = 0         # brace depth inside current lesson object
+        self._obj_start = -1    # index where current lesson object begins
+        self._in_string = False
+        self._escape = False
+
+    def feed(self, delta: str) -> list[dict]:
+        self._buf += delta
+        if not self._in_array:
+            marker = self._buf.find('"lessons"')
+            if marker == -1:
+                return []
+            bracket = self._buf.find("[", marker)
+            if bracket == -1:
+                return []
+            self._in_array = True
+            self._pos = bracket + 1
+
+        completed: list[dict] = []
+        while self._pos < len(self._buf):
+            ch = self._buf[self._pos]
+            if self._in_string:
+                if self._escape:
+                    self._escape = False
+                elif ch == "\\":
+                    self._escape = True
+                elif ch == '"':
+                    self._in_string = False
+            elif ch == '"':
+                self._in_string = True
+            elif ch == "{":
+                if self._depth == 0:
+                    self._obj_start = self._pos
+                self._depth += 1
+            elif ch == "}":
+                self._depth -= 1
+                if self._depth == 0 and self._obj_start != -1:
+                    chunk = self._buf[self._obj_start : self._pos + 1]
+                    try:
+                        completed.append(json.loads(chunk))
+                    except json.JSONDecodeError:
+                        logger.warning("lesson_stream_parse_failed", chunk_preview=chunk[:120])
+                    self._obj_start = -1
+            elif ch == "]" and self._depth == 0:
+                # lessons array closed - nothing more to scan for
+                self._pos = len(self._buf)
+                break
+            self._pos += 1
+        return completed
+
+
+def _build_suggested_lessons_schema() -> dict:
+    """Schema for v3/lessons/generate - suggestions only, no full prompt.
+
+    This matches the source system's v3 flow where generate returns suggestions
+    and generate_artifact creates the full lesson with checkpoints.
+    """
+    option_schema = {
+        "type": "object",
+        "properties": {
+            "template_id": {"type": "string"},
+            "exercise_subtype": {"type": ["string", "null"]},
+            "option": {"type": "string"},  # Human-readable action name
+        },
+        "required": ["template_id", "exercise_subtype", "option"],
+        "additionalProperties": False,
+    }
+    suggestion_schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "agent_mode": {"type": "string", "enum": ["learn_agent", "talk_agent"]},
+            "content": {"type": "string"},  # Raw content extracted from image
+            "options": {"type": "array", "items": option_schema},
+        },
+        "required": ["title", "agent_mode", "content", "options"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "rejected": {"type": "boolean"},
+            "reason_code": {"type": ["string", "null"]},
+            "reason": {"type": "string"},
+            "suggested_lessons": {"type": "array", "items": suggestion_schema},
+        },
+        "required": ["rejected", "reason_code", "reason", "suggested_lessons"],
+        "additionalProperties": False,
+    }
+
+
+def _build_lessons_output_schema() -> dict:
+    """Strict JSON schema for the full lesson format (used by v1 flow)."""
+    lesson_option_schema = {
+        "type": "object",
+        "properties": {
+            "template_id": {"type": "string"},
+            "exercise_subtype": {"type": ["string", "null"]},
+        },
+        "required": ["template_id", "exercise_subtype"],
+        "additionalProperties": False,
+    }
+    lesson_schema = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "summary": {"type": "string"},                # Vietnamese, 1-2 sentences
+            "detail_tasks_lesson": {"type": "string"},    # Vietnamese, 3 activities
+            "prompt_agent": {"type": "string"},           # Vietnamese, D1-D7 format
+            "agent_mode": {"type": "string", "enum": ["learn_agent", "talk_agent"]},
+            "options": {"type": "array", "items": lesson_option_schema},
+            "content": {"type": "string"},
+        },
+        "required": ["title", "summary", "detail_tasks_lesson", "prompt_agent", "agent_mode", "options", "content"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "rejected": {"type": "boolean"},
+            "reason_code": {"type": ["string", "null"]},
+            "reason": {"type": "string"},
+            "content": {"type": "string"},
+            "lessons": {"type": "array", "items": lesson_schema},
+        },
+        "required": ["rejected", "reason_code", "reason", "content", "lessons"],
+        "additionalProperties": False,
+    }
+
+
+_SUGGESTED_LESSONS_TEXT_FORMAT = {
+    "format": {
+        "type": "json_schema",
+        "name": "suggested_lessons_output",
+        "schema": _build_suggested_lessons_schema(),
+        "strict": True,
+    }
+}
+
+_LESSONS_TEXT_FORMAT = {
+    "format": {
+        "type": "json_schema",
+        "name": "lessons_output",
+        "schema": _build_lessons_output_schema(),
+        "strict": True,  # decoder-enforced - physically cannot violate schema
+    }
+}
 
 
 class OpenAIVisionAdapter:
@@ -15,15 +240,40 @@ class OpenAIVisionAdapter:
         client: AsyncOpenAI,
         model: str = "gpt-5.6-terra",  # Vision: $2/1M in, $12/1M out - quality/cost balance
         guardrail_model: str = "gpt-5.6-luna",  # Guardrail: $0.20/1M in - ultra cheap with built-in safety
+        suggestions_model: str | None = None,  # v3/lessons/generate; defaults to `model`
         temperature: float = 0.0,
         max_tokens: int = 32768,
     ):
         self._client = client
         self._model = model
         self._guardrail_model = guardrail_model
+        # v3 suggestions only need page segmentation + template choice, so this
+        # can be a smaller/faster model than full extraction.
+        self._suggestions_model = suggestions_model or model
         self._temperature = temperature
         self._max_tokens = max_tokens
-        self._image_cache: dict[str, str] = {}  # Cache downloaded images
+        # Shared HTTP client: one connection pool, no per-download TLS handshake
+        self._http: httpx.AsyncClient | None = None
+        # url -> in-flight/finished download task (raw bytes | None on failure).
+        # Concurrent guardrail + vision calls share ONE download per URL.
+        self._download_tasks: dict[str, asyncio.Task] = {}
+        # (url, variant) -> data URL
+        self._variant_cache: dict[tuple[str, str], str] = {}
+
+    @property
+    def model(self) -> str:
+        """Model used for full vision extraction (v1 flow)."""
+        return self._model
+
+    @property
+    def suggestions_model(self) -> str:
+        """Model used for v3/lessons/generate suggestions."""
+        return self._suggestions_model
+
+    @property
+    def guardrail_model(self) -> str:
+        """Model used for the safety/educational-value guardrail."""
+        return self._guardrail_model
 
     def _emit_llm(
         self,
@@ -34,6 +284,8 @@ class OpenAIVisionAdapter:
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
         total_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        model: str | None = None,
     ) -> None:
         """Metric-event: LLM vision OpenAI (latency/tokens/outcome). Never raises."""
         try:
@@ -41,63 +293,111 @@ class OpenAIVisionAdapter:
 
             from app.core.metric_events import emit as _metric_emit
 
+            cache_hit_ratio = None
+            if prompt_tokens and cached_tokens is not None:
+                cache_hit_ratio = round(cached_tokens / prompt_tokens, 3)
+
             _metric_emit(
                 "llm_generate",
                 provider="openai",
-                model=self._model,
+                model=model or self._model,
                 outcome=outcome,
                 error_type=error_type,
                 latency_ms=float((_time.monotonic() - start_ts) * 1000.0),
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                cached_tokens=cached_tokens,
+                cache_hit_ratio=cache_hit_ratio,
             )
         except Exception:  # noqa: BLE001
             pass
 
-    async def _download_image(self, url: str) -> str:
-        """Download image and return base64 data URL. Uses cache to avoid re-downloading."""
-        # Check cache first
-        if url in self._image_cache:
-            return self._image_cache[url]
+    def _log_cache(self, call: str, usage: dict, model: str | None = None) -> None:
+        """Structured log of prompt-cache effectiveness for this call."""
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        cached = usage.get("cached_tokens", 0)
+        logger.info(
+            "prompt_cache_usage",
+            call=call,
+            model=model or self._model,
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached,
+            cache_write_tokens=usage.get("cache_write_tokens", 0),
+            cache_hit_ratio=round(cached / prompt_tokens, 3) if prompt_tokens else 0.0,
+        )
 
+    # ------------------------------------------------------------------
+    # Image download & preparation
+    # ------------------------------------------------------------------
+    def _get_http(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(timeout=30, limits=httpx.Limits(max_connections=10))
+        return self._http
+
+    async def _download_raw(self, url: str) -> bytes | None:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                image_data = response.content
-                # Detect content type
-                content_type = response.headers.get("content-type", "image/jpeg")
-                b64_image = base64.b64encode(image_data).decode("utf-8")
-                result = f"data:{content_type};base64,{b64_image}"
-                # Cache for reuse
-                self._image_cache[url] = result
-                return result
-        except Exception as e:
+            response = await self._get_http().get(url)
+            response.raise_for_status()
+            return response.content
+        except Exception as e:  # noqa: BLE001
             logger.warning("image_download_failed", url=url, error=str(e))
-            # Fallback to original URL
-            return url
+            return None
+
+    def _evict_if_full(self) -> None:
+        if len(self._download_tasks) > _CACHE_MAX_ENTRIES:
+            self._download_tasks.clear()
+            self._variant_cache.clear()
+
+    async def _get_image(self, url: str, variant: str) -> str:
+        """Return data URL for the requested variant ('full' | 'low').
+
+        Raw bytes are downloaded at most once per URL (shared task), then each
+        variant is resized+encoded once and cached. Falls back to the original
+        URL when download fails (OpenAI fetches it directly).
+        """
+        key = (url, variant)
+        if key in self._variant_cache:
+            return self._variant_cache[key]
+
+        task = self._download_tasks.get(url)
+        if task is None:
+            self._evict_if_full()
+            task = asyncio.ensure_future(self._download_raw(url))
+            self._download_tasks[url] = task
+        raw = await task
+
+        if raw is None:
+            return url  # fallback: let OpenAI fetch the URL itself
+
+        max_dim = _VISION_MAX_DIM if variant == "full" else _GUARDRAIL_MAX_DIM
+        resized, mime = await asyncio.to_thread(_resize_image_sync, raw, max_dim)
+        data_url = f"data:{mime};base64,{base64.b64encode(resized).decode('utf-8')}"
+        self._variant_cache[key] = data_url
+        return data_url
+
+    async def _build_image_content(self, image_urls: list[str], variant: str) -> list[dict]:
+        """Download + prepare all images IN PARALLEL and return input_image items."""
+        images = await asyncio.gather(*(self._get_image(url, variant) for url in image_urls))
+        detail = "low" if variant == "low" else "auto"
+        return [{"type": "input_image", "image_url": img, "detail": detail} for img in images]
 
     def clear_image_cache(self) -> None:
-        """Clear the image cache after request completes."""
-        self._image_cache.clear()
+        """Clear cached downloads (kept for API compatibility)."""
+        self._download_tasks.clear()
+        self._variant_cache.clear()
 
-    def _convert_to_image_url(self, url_or_base64: str) -> dict:
-        """Convert URL or base64 to OpenAI image_url format."""
-        if url_or_base64.startswith("data:"):
-            return {"url": url_or_base64}
-        else:
-            return {"url": url_or_base64}
-
+    # ------------------------------------------------------------------
+    # LLM calls
+    # ------------------------------------------------------------------
+    @observe(name="vision_llm_call", capture_input=True, capture_output=True)
     async def extract(self, image_urls: list[str], prompt: str) -> tuple[str, dict[str, Any]]:
         """Extract content from images - returns (description, usage) tuple."""
         content: list[dict] = [{"type": "input_text", "text": prompt}]
-        for url in image_urls:
-            # Download image first to avoid OpenAI URL timeout issues
-            image_data = await self._download_image(url)
-            content.append({"type": "input_image", "image_url": image_data})
+        content += await self._build_image_content(image_urls, "full")
 
         logger.info("vision_api_call", model=self._model, image_count=len(image_urls))
+        _warn_if_uncacheable(prompt, "extract")
 
         import time as _time
         _llm_start = _time.monotonic()
@@ -107,68 +407,66 @@ class OpenAIVisionAdapter:
                 model=self._model,
                 input=[{"role": "user", "content": content}],
                 max_output_tokens=self._max_tokens,
+                prompt_cache_key=_prompt_cache_key(prompt),
             )
         except Exception as exc:  # noqa: BLE001
             self._emit_llm("error", _llm_start, error_type=type(exc).__name__)
             raise
 
         raw_text = response.output_text or ""
-
-        # Build usage dict
-        usage = {}
-        if response.usage:
-            usage = {
-                "prompt_tokens": response.usage.input_tokens or 0,
-                "completion_tokens": response.usage.output_tokens or 0,
-                "total_tokens": (response.usage.input_tokens or 0) + (response.usage.output_tokens or 0),
-            }
+        usage = self._usage_dict(response)
 
         logger.info("vision_api_response", tokens_used=usage.get("total_tokens", 0))
+        self._log_cache("extract", usage)
         self._emit_llm(
             "ok", _llm_start,
             prompt_tokens=usage.get("prompt_tokens"),
             completion_tokens=usage.get("completion_tokens"),
             total_tokens=usage.get("total_tokens"),
+            cached_tokens=usage.get("cached_tokens"),
         )
 
-        # Return tuple of (description, usage)
         return raw_text.strip(), usage
 
+    @observe(name="vision_safety_check", capture_input=False, capture_output=False)
     async def check_safety(self, image_urls: list[str], prompt: str) -> tuple[bool, str]:
-        """Check content safety using guardrail model. Returns (is_safe, reason). Fails open on parse error."""
+        """Check content safety using guardrail model. Returns (is_safe, reason). Fails open on parse error.
+
+        Uses LOW-RES image variant + detail:low - detecting unsafe content does
+        not need full resolution, and this cuts guardrail input tokens sharply.
+        """
         content: list[dict] = [{"type": "input_text", "text": prompt}]
-        for url in image_urls:
-            image_data = await self._download_image(url)  # Uses cache
-            content.append({"type": "input_image", "image_url": image_data})
+        content += await self._build_image_content(image_urls, "low")
 
         logger.info("vision_safety_check", model=self._guardrail_model, image_count=len(image_urls))
 
-        # Use Structured Outputs with strict schema for guardrail
         safety_schema = {
             "type": "object",
             "properties": {
                 "safe": {"type": "boolean"},
-                "reason": {"type": "string"}
+                "reason": {"type": "string"},
             },
             "required": ["safe", "reason"],
-            "additionalProperties": False
+            "additionalProperties": False,
         }
 
         response = await self._client.responses.create(
             model=self._guardrail_model,
             input=[{"role": "user", "content": content}],
             max_output_tokens=128,
+            prompt_cache_key=_prompt_cache_key(prompt),
             text={
                 "format": {
                     "type": "json_schema",
                     "name": "safety_check_output",
                     "schema": safety_schema,
-                    "strict": True
+                    "strict": True,
                 }
             },
         )
 
         raw_text = response.output_text or ""
+        self._log_cache("check_safety", self._usage_dict(response), model=self._guardrail_model)
         try:
             result = json.loads(raw_text.strip())
             return bool(result.get("safe", True)), str(result.get("reason", ""))
@@ -176,6 +474,44 @@ class OpenAIVisionAdapter:
             logger.warning("safety_check_parse_failed", raw_text_preview=raw_text[:100])
             return True, ""  # fail open
 
+    def _check_truncation(self, response: Any, raw_text: str, usage: dict) -> None:
+        """Raise a clear error when the response hit max_output_tokens."""
+        if getattr(response, "status", None) == "incomplete":
+            incomplete = getattr(response, "incomplete_details", None)
+            reason = getattr(incomplete, "reason", "unknown") if incomplete else "unknown"
+            logger.error(
+                "vision_v3_response_incomplete",
+                reason=reason,
+                max_output_tokens=self._max_tokens,
+                completion_tokens=usage.get("completion_tokens", 0),
+            )
+            from app.core.exceptions import VisionExtractionError
+            raise VisionExtractionError(
+                f"Vision response truncated ({reason}). "
+                f"Content requires more than max_output_tokens={self._max_tokens} - "
+                f"reduce image count or raise OPENAI_VISION_MAX_TOKENS.",
+                raw_response=raw_text[:500],
+            )
+
+    @staticmethod
+    def _usage_dict(response: Any) -> dict:
+        if not getattr(response, "usage", None):
+            return {}
+        prompt_tokens = response.usage.input_tokens or 0
+        completion_tokens = response.usage.output_tokens or 0
+        # OpenAI reports the cached subset of the prompt under
+        # input_tokens_details. cached_tokens = served FROM cache (discounted);
+        # cache_write_tokens = a miss that populated the cache for next time.
+        details = getattr(response.usage, "input_tokens_details", None)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cached_tokens": getattr(details, "cached_tokens", 0) or 0,
+            "cache_write_tokens": getattr(details, "cache_write_tokens", 0) or 0,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+    @observe(name="vision_llm_call_v3", capture_input=True, capture_output=True)
     async def extract_v3(self, image_urls: list[str], prompt: str) -> tuple[dict, dict[str, Any]]:
         """Extract structured content from images - returns (parsed_dict, usage) tuple.
 
@@ -184,90 +520,36 @@ class OpenAIVisionAdapter:
         - lessons array with: title, summary, detail_tasks_lesson, prompt_agent, agent_mode, options, content
         """
         content: list[dict] = [{"type": "input_text", "text": prompt}]
-        for url in image_urls:
-            image_data = await self._download_image(url)
-            content.append({"type": "input_image", "image_url": image_data})
+        content += await self._build_image_content(image_urls, "full")
 
         logger.info("vision_api_call_v3", model=self._model, image_count=len(image_urls))
-
-        # Use Structured Outputs with strict JSON schema - decoder enforced at sampling layer
-        # This guarantees 100% schema compliance, not just valid JSON
-        # UPDATED: Full lesson format matching source system
-        lesson_option_schema = {
-            "type": "object",
-            "properties": {
-                "template_id": {"type": "string"},
-                "exercise_subtype": {"type": ["string", "null"]}
-            },
-            "required": ["template_id", "exercise_subtype"],
-            "additionalProperties": False
-        }
-
-        lesson_schema = {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "summary": {"type": "string"},  # Vietnamese summary 1-2 sentences
-                "detail_tasks_lesson": {"type": "string"},  # Vietnamese, 3 activities
-                "prompt_agent": {"type": "string"},  # Vietnamese, D1-D7 format
-                "agent_mode": {"type": "string", "enum": ["learn_agent", "talk_agent"]},
-                "options": {"type": "array", "items": lesson_option_schema},
-                "content": {"type": "string"}
-            },
-            "required": ["title", "summary", "detail_tasks_lesson", "prompt_agent", "agent_mode", "options", "content"],
-            "additionalProperties": False
-        }
-
-        output_schema = {
-            "type": "object",
-            "properties": {
-                "rejected": {"type": "boolean"},
-                "reason_code": {"type": ["string", "null"]},
-                "reason": {"type": "string"},
-                "content": {"type": "string"},  # Success/failure message
-                "lessons": {"type": "array", "items": lesson_schema}
-            },
-            "required": ["rejected", "reason_code", "reason", "content", "lessons"],
-            "additionalProperties": False
-        }
+        _warn_if_uncacheable(prompt, "extract_v3")
 
         response = await self._client.responses.create(
             model=self._model,
             input=[{"role": "user", "content": content}],
             max_output_tokens=self._max_tokens,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "lessons_output",  # Full lesson format
-                    "schema": output_schema,
-                    "strict": True  # Enforced at decoder level - physically cannot violate schema
-                }
-            },
+            prompt_cache_key=_prompt_cache_key(prompt),
+            text=_LESSONS_TEXT_FORMAT,
         )
 
         raw_text = response.output_text or ""
+        usage = self._usage_dict(response)
+        self._log_cache("extract_v3", usage)
 
-        usage = {}
-        if response.usage:
-            usage = {
-                "prompt_tokens": response.usage.input_tokens or 0,
-                "completion_tokens": response.usage.output_tokens or 0,
-                "total_tokens": (response.usage.input_tokens or 0) + (response.usage.output_tokens or 0),
-            }
-
-        # Debug: log full response details
         logger.info(
             "vision_api_response_v3",
             tokens_used=usage.get("total_tokens", 0),
             output_text_length=len(raw_text),
             output_text_preview=raw_text[:200] if raw_text else "EMPTY",
             has_output=bool(response.output),
-            response_status=getattr(response, 'status', 'unknown'),
+            response_status=getattr(response, "status", "unknown"),
         )
+
+        self._check_truncation(response, raw_text, usage)
 
         try:
             result = json.loads(raw_text.strip())
-            # Log the keys to debug structure issues
             logger.info("vision_v3_json_keys", keys=list(result.keys()) if isinstance(result, dict) else "not_a_dict")
         except json.JSONDecodeError:
             logger.warning("vision_v3_json_parse_failed", raw_text_preview=raw_text[:200])
@@ -278,3 +560,126 @@ class OpenAIVisionAdapter:
             )
 
         return result, usage
+
+    @observe(name="vision_llm_call_v3_suggestions", capture_input=False, capture_output=False)
+    async def extract_v3_suggestions(self, image_urls: list[str], prompt: str) -> tuple[dict, dict[str, Any]]:
+        """Extract suggested lessons from images - clone of source v3/lessons/generate.
+
+        Returns format matching source:
+        - suggested_lessons array with: title, agent_mode, content, options
+
+        Uses json_object format like source (no strict schema).
+        """
+        content: list[dict] = [{"type": "input_text", "text": prompt}]
+        content += await self._build_image_content(image_urls, "full")
+
+        # v3 runs on the (smaller) suggestions model, not the full vision model.
+        model = self._suggestions_model
+        logger.info("vision_api_call_v3_suggestions", model=model, image_count=len(image_urls))
+
+        # Clone source: use json_object format, not strict schema
+        # Note: GPT-5.6 models don't support temperature parameter
+        response = await self._client.responses.create(
+            model=model,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=self._max_tokens,
+            prompt_cache_key=_prompt_cache_key(prompt),
+            text={"format": {"type": "json_object"}},
+        )
+
+        raw_text = response.output_text or ""
+        usage = self._usage_dict(response)
+        self._log_cache("extract_v3_suggestions", usage, model=model)
+
+        logger.info(
+            "vision_api_response_v3_suggestions",
+            tokens_used=usage.get("total_tokens", 0),
+            output_text_length=len(raw_text),
+            output_text_preview=raw_text[:200] if raw_text else "EMPTY",
+            has_output=bool(response.output),
+            response_status=getattr(response, "status", "unknown"),
+        )
+
+        self._check_truncation(response, raw_text, usage)
+
+        try:
+            result = json.loads(raw_text.strip())
+            logger.info("vision_v3_suggestions_keys", keys=list(result.keys()) if isinstance(result, dict) else "not_a_dict")
+        except json.JSONDecodeError:
+            logger.warning("vision_v3_suggestions_parse_failed", raw_text_preview=raw_text[:200])
+            from app.core.exceptions import VisionExtractionError
+            raise VisionExtractionError(
+                "Vision model returned invalid JSON",
+                raw_response=raw_text[:500],
+            )
+
+        return result, usage
+
+    @observe(name="vision_llm_call_v3_stream", capture_input=False, capture_output=False)
+    async def extract_v3_stream(
+        self, image_urls: list[str], prompt: str, model: str | None = None
+    ) -> AsyncGenerator[tuple[str, Any], None]:
+        """Streaming variant of extract_v3.
+
+        Args:
+            model: overrides the full-extraction model. The v3 flow passes the
+                   (smaller) suggestions model; v1 leaves it unset.
+
+        Yields:
+            ("lesson", lesson_dict)          - as soon as each lesson's JSON completes
+            ("complete", (result, usage))    - final parsed result + token usage
+        """
+        content: list[dict] = [{"type": "input_text", "text": prompt}]
+        content += await self._build_image_content(image_urls, "full")
+
+        model = model or self._model
+        logger.info("vision_api_call_v3_stream", model=model, image_count=len(image_urls))
+        _warn_if_uncacheable(prompt, "extract_v3_stream")
+
+        stream = await self._client.responses.create(
+            model=model,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=self._max_tokens,
+            prompt_cache_key=_prompt_cache_key(prompt),
+            text=_LESSONS_TEXT_FORMAT,
+            stream=True,
+        )
+
+        scanner = _LessonStreamScanner()
+        raw_text = ""
+        final_response: Any = None
+
+        async for event in stream:
+            event_type = getattr(event, "type", "")
+            if event_type.endswith("output_text.delta"):
+                delta = getattr(event, "delta", "") or ""
+                raw_text += delta
+                for lesson in scanner.feed(delta):
+                    yield ("lesson", lesson)
+            elif event_type in ("response.completed", "response.incomplete", "response.failed"):
+                final_response = getattr(event, "response", None)
+
+        usage = self._usage_dict(final_response) if final_response is not None else {}
+        self._log_cache("extract_v3_stream", usage, model=model)
+
+        logger.info(
+            "vision_api_response_v3_stream",
+            tokens_used=usage.get("total_tokens", 0),
+            output_text_length=len(raw_text),
+            response_status=getattr(final_response, "status", "unknown"),
+        )
+
+        if final_response is not None:
+            self._check_truncation(final_response, raw_text, usage)
+
+        try:
+            result = json.loads(raw_text.strip())
+        except json.JSONDecodeError:
+            logger.warning("vision_v3_stream_json_parse_failed", raw_text_preview=raw_text[:200])
+            from app.core.exceptions import VisionExtractionError
+            raise VisionExtractionError(
+                "Vision model returned invalid JSON",
+                raw_response=raw_text[:500],
+            )
+
+        yield ("complete", (result, usage))

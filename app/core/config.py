@@ -37,9 +37,29 @@ class Settings(BaseSettings):
     # Enable guardrail for custom "educational value" check
     openai_guardrail_enabled: bool = True
     openai_lesson_model: str = "gpt-4.1"
+    # v3/lessons/generate. Kept as its own knob so this endpoint can be tuned
+    # independently, but it must stay a strong vision model: generate is the
+    # ONLY step that sees the images, and generate_artifact works purely from
+    # the `content` text it produces (GenerateArtifactRequest has no
+    # image_urls). A transcription error here is unrecoverable downstream -
+    # e.g. misreading "12 / 5" makes artifact pre-solve the WRONG problem
+    # correctly, with no signal that anything went wrong.
+    # A smaller model was measured as faster but is not worth that ceiling.
+    openai_suggestions_model: str = "gpt-5.6-terra"
     openai_vision_temperature: float = 0.2
     openai_lesson_temperature: float = 0.7
-    openai_vision_max_tokens: int = 4000
+
+    # v3 multi-image requests are split into parallel calls: each call emits
+    # fewer output tokens, so wall-clock drops to roughly max() instead of
+    # sum(). Disable if lessons spanning two pages get split incorrectly.
+    openai_v3_parallel_images: bool = True
+    openai_v3_images_per_batch: int = 1   # images per call; raise to reduce page-boundary splits
+    openai_v3_max_concurrent: int = 4     # cap fan-out so we don't trip rate limits
+    # V3 single-call generates ALL lessons' full fields (content + summary +
+    # detail_tasks_lesson + prompt_agent) in one response. 5 dense pages can
+    # need 8-15 lessons x 400-800 tokens each. GPT-5.6 Terra supports 128K
+    # output; this is a cap, cost is only charged for tokens actually generated.
+    openai_vision_max_tokens: int = 16000
     openai_lesson_max_tokens: int = 8000
 
     mem0_base_url: str = ""

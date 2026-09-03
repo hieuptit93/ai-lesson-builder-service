@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 
 import structlog
+from langfuse import observe
 
 from app.api.v3.schemas.artifact_request import GenerateArtifactRequest
 from app.api.v1.schemas.lesson_request import GenerateLessonRequest, RegenerateLessonRequest
@@ -24,10 +25,13 @@ from app.domains.lesson_generator.application.services.prompt_builder import (
     _get_task_base_on_language_prompt,
 )
 from app.domains.memory.application.services.memory_service import MemoryService
+from app.domains.memory.domain.entities import UserMemory
 from app.domains.profile.application.services.profile_service import ProfileService
+from app.domains.profile.domain.entities import UserProfile
 from app.core.exceptions import AIServiceError, MissingImageUrlsError, UnsafeContentError, VisionExtractionError
 from app.domains.vision_extract.application.services.extraction_service import ExtractionService
-from app.utils.cost import estimate_cost
+from app.utils.cost import cache_savings, estimate_cost
+from app.utils.lesson_validation import summarize_reports, validate_lessons
 
 logger = structlog.get_logger()
 
@@ -59,14 +63,14 @@ def _enrich_checkpoint_specs(checkpoint_specs: list, exercise_subtypes: list[str
 
 
 template_option_labels = {
-    "ptl_learn_vocab_flashcard_v1": "Vocabulary",
-    "ptl_learn_phonics_pronunciation_v1": "Pronunciation",
-    "ptl_learn_exercise_solver_v1": "Solve exercises",
-    "ptl_learn_sentence_pattern_practice_v1": "Sentence patterns",
-    "ptl_learn_reading_comprehension_v1": "Reading comprehension",
-    "ptl_talk_roleplay_v1": "Roleplay conversation",
-    "ptl_talk_speaking_presentation_v1": "Presentation",
-    "ptl_talk_storytelling_v1": "Creative storytelling",
+    "ptl_learn_vocab_flashcard_v1": "Từ vựng",
+    "ptl_learn_phonics_pronunciation_v1": "Phát âm",
+    "ptl_learn_exercise_solver_v1": "Giải bài tập",
+    "ptl_learn_sentence_pattern_practice_v1": "Luyện mẫu câu",
+    "ptl_learn_reading_comprehension_v1": "Đọc hiểu",
+    "ptl_talk_roleplay_v1": "Nhập vai hội thoại",
+    "ptl_talk_speaking_presentation_v1": "Thuyết trình",
+    "ptl_talk_storytelling_v1": "Kể chuyện sáng tạo",
 }
 
 
@@ -162,6 +166,36 @@ def _transform_lesson_plan(
     return lesson_plan
 
 
+# Profile/memory sit on the critical path before the vision call (their data
+# personalizes generation). Bound them so a slow upstream can't stall lessons -
+# both services already fail-open internally, this only guards hangs/timeouts.
+_UPSTREAM_SOFT_TIMEOUT_S = 3.0
+
+
+async def _bounded_profile(coro, profile_id: str) -> "UserProfile":
+    try:
+        return await asyncio.wait_for(coro, timeout=_UPSTREAM_SOFT_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("profile_soft_timeout", profile_id=profile_id, timeout_s=_UPSTREAM_SOFT_TIMEOUT_S)
+        return UserProfile(
+            user_id=profile_id,
+            profile_id=profile_id,
+            child=None,
+            language_preference="vi",
+            raw_data=None,
+            is_degraded=True,
+            degraded_reason=f"Profile fetch exceeded {_UPSTREAM_SOFT_TIMEOUT_S}s soft timeout",
+        )
+
+
+async def _bounded_memory(coro, profile_id: str) -> "UserMemory":
+    try:
+        return await asyncio.wait_for(coro, timeout=_UPSTREAM_SOFT_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning("memory_soft_timeout", profile_id=profile_id, timeout_s=_UPSTREAM_SOFT_TIMEOUT_S)
+        return UserMemory(user_id=profile_id, facts=[], query_used="", total_found=0)
+
+
 def _build_personalization_context(
     child_name: str | None,
     child_age: int | None,
@@ -222,6 +256,82 @@ def _sse(payload: dict, event: str | None = None) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _cost_from_usage(model: str, usage: dict | None) -> float:
+    """Cost for one call, pricing cached hits and cache writes separately."""
+    if not usage:
+        return 0.0
+    return estimate_cost(
+        model=model,
+        prompt_tokens=usage.get("prompt_tokens", 0),
+        completion_tokens=usage.get("completion_tokens", 0),
+        cached_tokens=usage.get("cached_tokens", 0),
+        cache_write_tokens=usage.get("cache_write_tokens", 0),
+    )
+
+
+def _cache_savings_from_usage(model: str, usage: dict | None) -> float:
+    """Net USD the prompt cache saved on one call (negative on a write-only call)."""
+    if not usage:
+        return 0.0
+    return cache_savings(
+        model,
+        usage.get("cached_tokens", 0),
+        usage.get("cache_write_tokens", 0),
+    )
+
+
+def _validate_and_log(lessons: list, *, request_id: str, flow: str) -> dict:
+    """Run cross-field validation, log findings, emit a metric. Never raises.
+
+    Pure-Python check (~1ms/lesson), so it runs inline before the response is
+    returned. Errors are structural; warnings are soft signals kept for prompt
+    tuning. Neither blocks the response - the summary rides along in metadata
+    so callers can decide (and so a future response cache can gate on it).
+    """
+    try:
+        reports = validate_lessons(lessons)
+        summary = summarize_reports(reports)
+
+        for report in reports:
+            if report.errors:
+                logger.warning(
+                    "lesson_validation.errors",
+                    request_id=request_id,
+                    flow=flow,
+                    **report.as_log_dict(),
+                    messages=[i.message for i in report.errors],
+                )
+            elif report.warnings:
+                logger.info(
+                    "lesson_validation.warnings",
+                    request_id=request_id,
+                    flow=flow,
+                    **report.as_log_dict(),
+                    messages=[i.message for i in report.warnings],
+                )
+
+        try:
+            from app.core.metric_events import emit as _metric_emit
+
+            _metric_emit(
+                "lesson_validation",
+                flow=flow,
+                outcome="ok" if summary["all_valid"] else "invalid",
+                lessons_checked=summary["lessons_checked"],
+                lessons_with_errors=summary["lessons_with_errors"],
+                error_count=summary["error_count"],
+                warning_count=summary["warning_count"],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        # Validation must never break generation.
+        logger.warning("lesson_validation.failed", request_id=request_id, error=str(exc))
+        return {}
+
+
 class LessonPipeline:
     # Expert avatar URLs mapping
     EXPERT_AVATARS = {
@@ -249,7 +359,17 @@ class LessonPipeline:
     # ------------------------------------------------------------------
     # Sync mode
     # ------------------------------------------------------------------
+    @observe(name="lesson_pipeline.generate", capture_input=False, capture_output=True)
     async def generate(self, request: GenerateLessonRequest, *, request_id: str) -> dict:
+        """V1 lesson generation - single-call with 5-expert deliberation.
+
+        Optimized flow:
+        1. Profile + Memory fetched in parallel
+        2. Single vision call with 5-expert prompt (combines vision + generation)
+
+        This reduces latency from ~20s (vision + generator) to ~10-12s while
+        maintaining the same quality through 5-expert deliberation format.
+        """
         start = time.monotonic()
 
         logger.info(
@@ -267,7 +387,7 @@ class LessonPipeline:
         purpose = parent_config.purpose if parent_config else "review"
         custom_prompt = request.custom_prompt if request.custom_prompt is not None else (parent_config.custom_prompt if parent_config else None)
 
-        # Run all 3 APIs in parallel: Profile, Memory, Vision
+        # Fetch profile and memory in parallel (needed for personalization)
         async def fetch_profile():
             return await self._profile.fetch_profile(
                 profile_id=request.profile_id,
@@ -281,19 +401,7 @@ class LessonPipeline:
                 subject=subject,
             )
 
-        async def extract_vision():
-            if request.image_urls:
-                return await self._extraction.extract_from_images(
-                    image_urls=request.image_urls,
-                    subject_hint=subject,
-                )
-            return ""
-
-        user_profile, memory, image_description = await asyncio.gather(
-            fetch_profile(),
-            fetch_memory(),
-            extract_vision(),
-        )
+        user_profile, memory = await asyncio.gather(fetch_profile(), fetch_memory())
 
         is_mock_data = user_profile.is_degraded
 
@@ -306,24 +414,67 @@ class LessonPipeline:
 
         language = (parent_config.language if parent_config and parent_config.language else None) or user_profile.language_preference or "vi"
 
-        extracted_content = {
-            "raw_text": image_description or custom_prompt or "",
-            "topic_detected": custom_prompt or subject,
-            "subject_detected": subject,
-        }
-
-        expert_log, lesson_plan = await self._generator.generate_lesson(
-            extracted_content=extracted_content,
-            subject=subject,
-            purpose=purpose,
-            language=language,
-            memory_facts=memory.facts if memory.facts else None,
-            parent_notes=custom_prompt,
-            child_age=child_age,
-            child_name=child_name,
-        )
+        # Single-call: Vision + 5-expert deliberation → lessons
+        # This replaces the old 2-call flow (extract_from_images + generate_lesson)
+        if request.image_urls:
+            lesson_plan, token_usage, expert_log = await self._extraction.extract_v1_5expert(
+                image_urls=request.image_urls,
+                subject=subject,
+                purpose=purpose,
+                language=language,
+                memory_facts=memory.facts if memory.facts else None,
+                child_name=child_name,
+                child_age=child_age,
+                parent_notes=custom_prompt,
+            )
+        else:
+            # No images: fall back to text-only generation
+            extracted_content = {
+                "raw_text": custom_prompt or "",
+                "topic_detected": custom_prompt or subject,
+                "subject_detected": subject,
+            }
+            expert_log, lesson_plan = await self._generator.generate_lesson(
+                extracted_content=extracted_content,
+                subject=subject,
+                purpose=purpose,
+                language=language,
+                memory_facts=memory.facts if memory.facts else None,
+                parent_notes=custom_prompt,
+                child_age=child_age,
+                child_name=child_name,
+            )
+            token_usage = {}
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        # Check for rejected content
+        if lesson_plan.get("rejected"):
+            logger.warning(
+                "pipeline.rejected",
+                log_type="job",
+                feature="LESSON",
+                request_id=request_id,
+                reason_code=lesson_plan.get("reason_code"),
+                reason=lesson_plan.get("reason"),
+            )
+            return {
+                "request_id": request_id,
+                "status": "rejected",
+                "data": {
+                    "rejected": True,
+                    "reason_code": lesson_plan.get("reason_code", "content_rejected"),
+                    "reason": lesson_plan.get("reason", "Content was rejected"),
+                    "lessons": [],
+                    "metadata": {
+                        "request_id": request_id,
+                        "profile_id": request.profile_id,
+                        "processing_time_ms": elapsed_ms,
+                        "content_safety_passed": False,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                },
+            }
 
         dynamic_memory = "\n".join(f"- {f.text}" for f in memory.facts) if memory.facts else None
 
@@ -336,6 +487,10 @@ class LessonPipeline:
             dynamic_memory=dynamic_memory,
         )
 
+        # Calculate cost for single-call model
+        vision_model = self._settings.openai_vision_model if self._settings else "gpt-5.6-terra"
+        cost_usd = _cost_from_usage(vision_model, token_usage)
+
         data = {
             **lesson_plan,
             "metadata": {
@@ -344,15 +499,19 @@ class LessonPipeline:
                 "child_name": child_name,
                 "child_age": child_age,
                 "language": language,
-                "model_used": "gpt-4o + gpt-4.1",
+                "model_used": vision_model,  # Single model now
                 "memory_facts_used": [f.text for f in memory.facts] if memory.facts else [],
                 "processing_time_ms": elapsed_ms,
                 "content_safety_passed": True,
-                "pipeline_version": "2.0.0",
+                "pipeline_version": "2.1.0",  # Bumped for single-call optimization
                 "is_mock_data": is_mock_data,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "expert_discussion_log": expert_log,
-                "vision_extracted_text": image_description,
+                "vision_extracted_text": lesson_plan.get("content", ""),  # From 5-expert extraction
+                "usage": token_usage,
+                "cost_usd": cost_usd,
+                "cached_tokens": token_usage.get("cached_tokens", 0),
+                "cache_write_tokens": token_usage.get("cache_write_tokens", 0),
             },
         }
 
@@ -365,10 +524,14 @@ class LessonPipeline:
             duration_ms=elapsed_ms,
             lessons_count=len(lesson_plan.get("lessons", [])),
             is_mock_data=is_mock_data,
+            prompt_tokens=token_usage.get("prompt_tokens", 0),
+            completion_tokens=token_usage.get("completion_tokens", 0),
+            cost_usd=cost_usd,
         )
 
         return {"request_id": request_id, "status": "success", "data": data}
 
+    @observe(name="lesson_pipeline.generate_v3", capture_input=False, capture_output=False)
     async def generate_v3(self, request: GenerateLessonRequest, *, request_id: str) -> dict:
         start = time.monotonic()
 
@@ -419,26 +582,62 @@ class LessonPipeline:
                     subject=subject,
                 )
 
-            # Phase 1: guardrail + profile + memory in PARALLEL (all fast/cheap).
-            # Profile & memory must complete BEFORE vision so the generation
-            # step receives child personalization context (source-system parity).
-            guardrail_detail, user_profile, memory = await asyncio.gather(
+            # v3/lessons/generate returns suggested_lessons ONLY - no personalization needed.
+            # Run guardrail + vision + profile ALL IN PARALLEL for maximum speed.
+            # Profile is fetched for metadata/logging but NOT used for generation.
+
+            async def run_vision():
+                return await self._extraction.extract_suggestions_v3(
+                    image_urls=request.image_urls,
+                    subject_hint=subject,
+                    custom_prompt=custom_prompt,
+                )
+
+            # All three run concurrently - vision doesn't wait for anything
+            guardrail_result, vision_result, user_profile = await asyncio.gather(
                 run_guardrail(),
-                fetch_profile(),
-                fetch_memory(),
+                run_vision(),
+                _bounded_profile(fetch_profile(), request.profile_id),
+                return_exceptions=True,
             )
 
+            # Handle guardrail result
+            guardrail_detail = ""
+            if isinstance(guardrail_result, Exception):
+                logger.warning("guardrail_exception", error=str(guardrail_result))
+            else:
+                guardrail_detail = guardrail_result or ""
+
+            # Handle vision result
+            if isinstance(vision_result, Exception):
+                raise vision_result
+            extracted_result, token_usage = vision_result
+
+            # Handle profile result (for logging only)
+            if isinstance(user_profile, Exception):
+                logger.warning("profile_exception", error=str(user_profile))
+                user_profile = UserProfile(
+                    user_id=request.profile_id,
+                    profile_id=request.profile_id,
+                    child=None,
+                    language_preference="vi",
+                    raw_data=None,
+                    is_degraded=True,
+                    degraded_reason=str(user_profile),
+                )
+            # Check guardrail after gather - vision already ran (optimistic execution)
             if guardrail_detail:
                 elapsed_ms = int((time.monotonic() - start) * 1000)
+                logger.warning(
+                    "guardrail_rejected",
+                    request_id=request_id,
+                    reason=guardrail_detail,
+                )
                 return {
                     "request_id": request_id,
                     "status": "failed",
                     "data": {
-                        "rejected": True,
-                        "reason_code": "unsafe_content",
-                        "reason": guardrail_detail,
-                        "content": "",
-                        "lessons": [],
+                        "detail": {"code": "unsafe_content", "message": guardrail_detail},
                         "metadata": {
                             "language": language,
                             "processing_time_ms": elapsed_ms,
@@ -447,32 +646,11 @@ class LessonPipeline:
                             "token_usage": None,
                             "cost_usd": 0.0,
                         },
+                        "suggested_lessons": [],
                     },
                 }
 
-            # Resolve child info BEFORE vision call so it can personalize generation
-            if user_profile.child:
-                child_age = user_profile.child.age or (parent_config.child_age if parent_config else None)
-                child_name = user_profile.child.child_name or (parent_config.child_name if parent_config else None)
-            else:
-                child_age = parent_config.child_age if parent_config else None
-                child_name = parent_config.child_name if parent_config else None
-            learning_history = user_profile.child.learning_history if user_profile.child else []
-
-            personalization_context = _build_personalization_context(
-                child_name=child_name,
-                child_age=child_age,
-                learning_history=learning_history,
-                memory_facts=memory.facts,
-            )
-
-            # Phase 2: vision + lesson generation in ONE call, now personalized
-            extracted_result, token_usage = await self._extraction.extract_from_images_v3(
-                image_urls=request.image_urls,
-                subject_hint=subject,
-                custom_prompt=custom_prompt,
-                personalization_context=personalization_context,
-            )
+            # extracted_result and token_usage already set from gather
 
             # Validate and normalize response format
             if not extracted_result:
@@ -488,11 +666,7 @@ class LessonPipeline:
                     "request_id": request_id,
                     "status": "failed",
                     "data": {
-                        "rejected": True,
-                        "reason_code": extracted_result.get("reason_code", "content_rejected"),
-                        "reason": extracted_result.get("reason", "Content was rejected"),
-                        "content": extracted_result.get("content", ""),
-                        "lessons": [],
+                        "detail": {},
                         "metadata": {
                             "language": language,
                             "processing_time_ms": elapsed_ms,
@@ -501,40 +675,23 @@ class LessonPipeline:
                             "token_usage": token_usage,
                             "cost_usd": 0.0,
                         },
+                        "suggested_lessons": [],
                     },
                 }
 
-            if "lessons" not in extracted_result:
-                # Log the actual keys for debugging
-                actual_keys = list(extracted_result.keys()) if isinstance(extracted_result, dict) else "not_dict"
-                logger.warning(
-                    "vision_response_wrong_format",
-                    expected_key="lessons",
-                    actual_keys=actual_keys,
-                    response_preview=str(extracted_result)[:300],
-                )
-                # Try to handle legacy format
-                if isinstance(extracted_result, dict) and "suggested_lessons" in extracted_result:
-                    extracted_result["lessons"] = extracted_result.pop("suggested_lessons")
-                else:
-                    raise VisionExtractionError(
-                        f"Vision model returned wrong format. Expected 'lessons', got keys: {actual_keys}",
-                        raw_response=str(extracted_result)[:500],
-                    )
+            # v3/lessons/generate returns suggested_lessons (not full lessons)
+            # extracted_result is a dict with "suggested_lessons" array
+            suggested_lessons_list = extracted_result.get("suggested_lessons", [])
 
-            if not extracted_result.get("lessons"):
-                # Model found no teachable content but did not reject - treat as rejection
-                logger.warning("vision_v3_empty_lessons", request_id=request_id)
+            if not suggested_lessons_list:
+                # Model found no teachable content
+                logger.warning("vision_v3_empty_suggestions", request_id=request_id)
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 return {
                     "request_id": request_id,
                     "status": "failed",
                     "data": {
-                        "rejected": True,
-                        "reason_code": "no_educational_content",
-                        "reason": "Không tìm thấy nội dung học tập rõ ràng trong ảnh",
-                        "content": "",
-                        "lessons": [],
+                        "detail": {},
                         "metadata": {
                             "language": language,
                             "processing_time_ms": elapsed_ms,
@@ -543,53 +700,48 @@ class LessonPipeline:
                             "token_usage": token_usage,
                             "cost_usd": 0.0,
                         },
+                        "suggested_lessons": [],
                     },
                 }
 
-            for lesson in extracted_result.get("lessons", []):
-                lesson["options"] = _enrich_options(lesson.get("options", []))
+            # Enrich options for each suggestion
+            for suggestion in suggested_lessons_list:
+                suggestion["options"] = _enrich_options(suggestion.get("options", []))
 
             is_mock_data = user_profile.is_degraded
-            language = (parent_config.language if parent_config and parent_config.language else None) or user_profile.language_preference or "vi"
+            if user_profile.child:
+                child_age = user_profile.child.age
+                child_name = user_profile.child.child_name
+            else:
+                child_age = parent_config.child_age if parent_config else None
+                child_name = parent_config.child_name if parent_config else None
 
-            # Transform lessons: add lesson_id and finally_prompt_agent
-            dynamic_memory = "\n".join(f"- {f.text}" for f in memory.facts) if memory.facts else None
-            transformed_result = _transform_lesson_plan(
-                {"lessons": extracted_result.get("lessons", [])},
-                child_name=child_name,
-                child_age=child_age,
-                language=language,
-                favorite_movie=None,
-                dynamic_memory=dynamic_memory,
-            )
+            language = (parent_config.language if parent_config and parent_config.language else None) or user_profile.language_preference or "vi"
 
             elapsed_ms = int((time.monotonic() - start) * 1000)
 
-            # Get vision model from settings for accurate cost estimation
-            vision_model = self._settings.openai_vision_model if self._settings else "gpt-5.6-terra"
+            # v3 runs on the suggestions model, so cost must be priced with it.
+            vision_model = self._settings.openai_suggestions_model if self._settings else "gpt-5.6-terra"
 
+            # Return suggested_lessons format matching source system
+            # NOTE: No finally_prompt_agent here - that's created by generate_artifact
             data = {
-                "rejected": extracted_result.get("rejected", False),
-                "reason_code": extracted_result.get("reason_code"),
-                "reason": extracted_result.get("reason", ""),
-                "content": extracted_result.get("content", "Đã tạo bài học thành công"),
-                "lessons": transformed_result.get("lessons", []),
+                "detail": {},
                 "metadata": {
                     "language": language,
                     "child_name": child_name,
                     "child_age": child_age,
-                    "memory_facts_used": [f.text for f in memory.facts] if memory.facts else [],
+                    "is_mock_data": is_mock_data,
                     "processing_time_ms": elapsed_ms,
                     "content_safety_passed": True,
                     "created_at": datetime.now(timezone.utc).isoformat(),
-                    "model_used": vision_model,  # Option B: only vision model, no separate lesson gen
                     "token_usage": token_usage,
-                    "cost_usd": estimate_cost(
-                        model=vision_model,
-                        prompt_tokens=(token_usage or {}).get("prompt_tokens", 0),
-                        completion_tokens=(token_usage or {}).get("completion_tokens", 0),
-                    ) if token_usage else 0.0,
+                    "cost_usd": _cost_from_usage(vision_model, token_usage),
+                    "cached_tokens": (token_usage or {}).get("cached_tokens", 0),
+                    "cache_write_tokens": (token_usage or {}).get("cache_write_tokens", 0),
+                    "cache_savings_usd": _cache_savings_from_usage(vision_model, token_usage),
                 },
+                "suggested_lessons": suggested_lessons_list,
             }
 
             logger.info(
@@ -658,14 +810,21 @@ class LessonPipeline:
                 },
             }
 
+    @observe(name="lesson_pipeline.stream_generate_v3", capture_input=False, capture_output=False)
     async def stream_generate_v3(
         self,
         request: GenerateLessonRequest,
         *,
         request_id: str,
         delay: float = 0.0,
+        use_full_prompt: bool = False,
     ) -> AsyncGenerator[str, None]:
-        """Stream v3 lesson generation (vision -> suggested_lessons) with SSE."""
+        """Stream v3 lesson generation (vision -> suggested_lessons) with SSE.
+
+        Args:
+            use_full_prompt: If True, use full prompt with D-steps (for v1 optimization ~10s).
+                            If False, use Langfuse lightweight prompt (for v3).
+        """
         start = time.monotonic()
 
         try:
@@ -674,7 +833,7 @@ class LessonPipeline:
             custom_prompt = request.custom_prompt if request.custom_prompt is not None else (parent_config.custom_prompt if parent_config else None)
 
             pipeline_image = getattr(self._settings, "pipeline_robot_image_url", "") if self._settings else ""
-            yield _sse({"phase": "started", "request_id": request_id, "message": "Pika is analyzing request...", "image_url": pipeline_image}, "pipeline")
+            yield _sse({"phase": "started", "request_id": request_id, "message": "Pika đang phân tích yêu cầu...", "image_url": pipeline_image}, "pipeline")
 
             async def fetch_profile():
                 return await self._profile.fetch_profile(
@@ -706,15 +865,57 @@ class LessonPipeline:
                     subject=subject,
                 )
 
-            # Phase 1: guardrail + profile + memory in PARALLEL,
-            # so the vision call can be personalized with child context.
-            guardrail_detail, user_profile, memory = await asyncio.gather(
-                run_guardrail(),
-                fetch_profile(),
-                fetch_memory(),
+            # OPTIMISTIC EXECUTION: guardrail starts immediately and overlaps
+            # the (bounded) profile/memory fetch AND the vision stream.
+            guardrail_task = asyncio.create_task(run_guardrail())
+
+            user_profile, memory = await asyncio.gather(
+                _bounded_profile(fetch_profile(), request.profile_id),
+                _bounded_memory(fetch_memory(), request.profile_id),
             )
 
+            # Resolve child info BEFORE vision call so it can personalize generation
+            if user_profile.child:
+                child_age = user_profile.child.age or (parent_config.child_age if parent_config else None)
+                child_name = user_profile.child.child_name or (parent_config.child_name if parent_config else None)
+            else:
+                child_age = parent_config.child_age if parent_config else None
+                child_name = parent_config.child_name if parent_config else None
+            learning_history = user_profile.child.learning_history if user_profile.child else []
+
+            yield _sse({
+                "phase": "profile",
+                "message": f"Đã lấy thông tin bé: {child_name or 'N/A'}",
+                "child_name": child_name,
+                "child_age": child_age,
+                "language": user_profile.language_preference,
+                "image_url": pipeline_image,
+            }, "pipeline")
+
+            personalization_context = _build_personalization_context(
+                child_name=child_name,
+                child_age=child_age,
+                learning_history=learning_history,
+                memory_facts=memory.facts,
+            )
+
+            # REAL STREAMING: lessons are pushed to the client the moment each
+            # one's JSON completes, instead of waiting for the full response.
+            # The vision request is kicked off via first_event_task so it runs
+            # concurrently with the still-in-flight guardrail check.
+            stream_gen = self._extraction.extract_from_images_v3_stream(
+                image_urls=request.image_urls,
+                subject_hint=subject,
+                custom_prompt=custom_prompt,
+                personalization_context=personalization_context,
+                use_full_prompt=use_full_prompt,
+            )
+            first_event_task = asyncio.create_task(stream_gen.__anext__())
+
+            guardrail_detail = await guardrail_task
             if guardrail_detail:
+                first_event_task.cancel()
+                await stream_gen.aclose()
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 language = (parent_config.language if parent_config and parent_config.language else None) or "vi"
                 data = {
@@ -736,38 +937,33 @@ class LessonPipeline:
                 yield "data: [DONE]\n\n"
                 return
 
-            # Resolve child info BEFORE vision call so it can personalize generation
-            if user_profile.child:
-                child_age = user_profile.child.age or (parent_config.child_age if parent_config else None)
-                child_name = user_profile.child.child_name or (parent_config.child_name if parent_config else None)
-            else:
-                child_age = parent_config.child_age if parent_config else None
-                child_name = parent_config.child_name if parent_config else None
-            learning_history = user_profile.child.learning_history if user_profile.child else []
-
-            yield _sse({
-                "phase": "profile",
-                "message": f"Profile fetched: {child_name or 'N/A'}",
-                "child_name": child_name,
-                "child_age": child_age,
-                "language": user_profile.language_preference,
-                "image_url": pipeline_image,
-            }, "pipeline")
-
-            personalization_context = _build_personalization_context(
-                child_name=child_name,
-                child_age=child_age,
-                learning_history=learning_history,
-                memory_facts=memory.facts,
-            )
-
-            # Phase 2: vision + lesson generation in ONE call, now personalized
-            extracted_result, token_usage = await self._extraction.extract_from_images_v3(
-                image_urls=request.image_urls,
-                subject_hint=subject,
-                custom_prompt=custom_prompt,
-                personalization_context=personalization_context,
-            )
+            # Consume the vision stream. "lesson_ready" events are previews
+            # (no finally_prompt_agent yet); the final "complete" payload
+            # carries the authoritative fully-transformed lessons.
+            extracted_result: dict = {}
+            token_usage: dict = {}
+            lesson_index = 0
+            event = await first_event_task
+            while True:
+                event_type, payload = event
+                if event_type == "lesson":
+                    lesson_index += 1
+                    preview = dict(payload)
+                    preview["lesson_id"] = f"lesson_{lesson_index:03d}"
+                    preview["options"] = _enrich_options(preview.get("options", []))
+                    yield _sse({
+                        "phase": "lesson_ready",
+                        "index": lesson_index,
+                        "lesson": preview,
+                        "image_url": pipeline_image,
+                    }, "lesson")
+                elif event_type == "complete":
+                    extracted_result, token_usage = payload
+                    break
+                try:
+                    event = await stream_gen.__anext__()
+                except StopAsyncIteration:
+                    break
 
             # Validate and normalize response format
             if not extracted_result:
@@ -853,49 +1049,115 @@ class LessonPipeline:
             if request.image_urls:
                 yield _sse({
                     "phase": "vision_complete",
-                    "message": "Image analysis complete",
+                    "message": "Đã phân tích hình ảnh xong",
                     "image_url": pipeline_image,
                 }, "pipeline")
 
-            # Transform lessons: add lesson_id and finally_prompt_agent
-            dynamic_memory = "\n".join(f"- {f.text}" for f in memory.facts) if memory.facts else None
-            transformed_result = _transform_lesson_plan(
-                {"lessons": extracted_result.get("lessons", [])},
-                child_name=child_name,
-                child_age=child_age,
-                language=language,
-                favorite_movie=None,
-                dynamic_memory=dynamic_memory,
-            )
+            # Cross-field validation runs on the RAW model output, before our
+            # own transform touches it - that measures prompt quality, not
+            # post-processing. Only the v1 flow has the fields to check
+            # (summary / detail_tasks_lesson / prompt_agent); v3 suggestions
+            # carry title+content only and are validated after generate_artifact.
+            validation_summary: dict = {}
+            if use_full_prompt:
+                validation_summary = _validate_and_log(
+                    extracted_result.get("lessons", []),
+                    request_id=request_id,
+                    flow="v1_stream",
+                )
+
+            # v1 needs full transform (lesson_id, finally_prompt_agent, etc)
+            # v3 needs raw lessons from vision (agent_mode, content, options, title only)
+            if use_full_prompt:
+                # v1: Transform lessons with personalization
+                dynamic_memory = "\n".join(f"- {f.text}" for f in memory.facts) if memory.facts else None
+                transformed_result = _transform_lesson_plan(
+                    {"lessons": extracted_result.get("lessons", [])},
+                    child_name=child_name,
+                    child_age=child_age,
+                    language=language,
+                    favorite_movie=None,
+                    dynamic_memory=dynamic_memory,
+                )
+                # Strip fields not needed for v1
+                FIELDS_TO_REMOVE = {"agent_mode", "options", "content"}
+                for lesson in transformed_result.get("lessons", []):
+                    for field in FIELDS_TO_REMOVE:
+                        lesson.pop(field, None)
+            else:
+                # v3: Use raw lessons with only required fields (agent_mode, content, options, title)
+                raw_lessons = extracted_result.get("suggested_lessons", []) or extracted_result.get("lessons", [])
+                V3_FIELDS_TO_KEEP = {"agent_mode", "content", "options", "title"}
+                filtered_lessons = [
+                    {k: v for k, v in lesson.items() if k in V3_FIELDS_TO_KEEP}
+                    for lesson in raw_lessons
+                ]
+                transformed_result = {"lessons": filtered_lessons}
 
             elapsed_ms = int((time.monotonic() - start) * 1000)
 
-            # Get vision model from settings for accurate cost estimation
-            vision_model = self._settings.openai_vision_model if self._settings else "gpt-5.6-terra"
+            # v1 uses the full extraction model; v3 uses the suggestions model.
+            # Must match what extract_from_images_v3_stream actually called.
+            if self._settings:
+                vision_model = (
+                    self._settings.openai_vision_model
+                    if use_full_prompt
+                    else self._settings.openai_suggestions_model
+                )
+            else:
+                vision_model = "gpt-5.6-terra"
 
-            data = {
-                "rejected": extracted_result.get("rejected", False),
-                "reason_code": extracted_result.get("reason_code"),
-                "reason": extracted_result.get("reason", ""),
-                "content": extracted_result.get("content", "Đã tạo bài học thành công"),
-                "lessons": transformed_result.get("lessons", []),
-                "metadata": {
-                    "language": language,
-                    "child_name": child_name,
-                    "child_age": child_age,
-                    "memory_facts_used": [f.text for f in memory.facts] if memory.facts else [],
-                    "processing_time_ms": elapsed_ms,
-                    "content_safety_passed": True,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "model_used": vision_model,  # Option B: only vision model, no separate lesson gen
-                    "usage": token_usage,
-                    "cost_usd": estimate_cost(
-                        model=vision_model,
-                        prompt_tokens=(token_usage or {}).get("prompt_tokens", 0),
-                        completion_tokens=(token_usage or {}).get("completion_tokens", 0),
-                    ) if token_usage else 0.0,
-                },
+            # Extract vision_extracted_text from lesson summaries (content field removed for speed optimization)
+            lessons_list = extracted_result.get("suggested_lessons", []) or extracted_result.get("lessons", [])
+            vision_text_parts = [lesson.get("summary", "") for lesson in lessons_list if lesson.get("summary")]
+            vision_extracted_text = "\n".join(vision_text_parts) if vision_text_parts else ""
+
+            # Build response data - different format for v1 vs v3
+            lessons_data = transformed_result.get("lessons", [])
+
+            metadata = {
+                "request_id": request_id,
+                "profile_id": request.profile_id,
+                "language": language,
+                "child_name": child_name,
+                "child_age": child_age,
+                "memory_facts_used": [f.text for f in memory.facts] if memory.facts else [],
+                "processing_time_ms": elapsed_ms,
+                "content_safety_passed": True,
+                "pipeline_version": "2.0.0",
+                "is_mock_data": is_mock_data,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "model_used": vision_model,
+                "expert_discussion_log": "",
+                "vision_extracted_text": vision_extracted_text,
+                "usage": token_usage,
+                "cost_usd": _cost_from_usage(vision_model, token_usage),
+                "cached_tokens": (token_usage or {}).get("cached_tokens", 0),
+                "cache_write_tokens": (token_usage or {}).get("cache_write_tokens", 0),
+                "cache_savings_usd": _cache_savings_from_usage(vision_model, token_usage),
+                "validation": validation_summary,
             }
+
+            if use_full_prompt:
+                # v1 format: uses "lessons" key with full metadata
+                data = {
+                    "rejected": extracted_result.get("rejected", False),
+                    "reason_code": extracted_result.get("reason_code"),
+                    "reason": extracted_result.get("reason", ""),
+                    "content": "Đã tạo bài học thành công",
+                    "lessons": lessons_data,
+                    "metadata": metadata,
+                }
+            else:
+                # v3 format: uses "suggested_lessons" key, simpler structure
+                data = {
+                    "rejected": extracted_result.get("rejected", False),
+                    "reason_code": extracted_result.get("reason_code"),
+                    "reason": extracted_result.get("reason", ""),
+                    "detail": "",
+                    "suggested_lessons": lessons_data,
+                    "metadata": metadata,
+                }
 
             yield _sse({"phase": "complete", "data": data, "image_url": pipeline_image}, "pipeline")
             yield "data: [DONE]\n\n"
@@ -912,6 +1174,7 @@ class LessonPipeline:
             yield _sse({"phase": "error", "code": "internal_error", "message": str(exc)}, "error")
             yield "data: [DONE]\n\n"
 
+    @observe(name="lesson_pipeline.generate_artifact_v3", capture_input=False, capture_output=False)
     async def generate_artifact_v3(self, request: GenerateArtifactRequest, *, request_id: str) -> dict:
         start = time.monotonic()
 
@@ -948,10 +1211,10 @@ class LessonPipeline:
             child_name = None
         language = user_profile.language_preference or "vi"
 
-        artifact_lessons = []
-        total_token_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        total_token_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0, "total_tokens": 0}
 
-        for idx, lesson_item in enumerate(request.lessons, start=1):
+        # OPTIMIZATION: Generate all lessons in PARALLEL instead of sequential
+        async def generate_single_lesson(idx: int, lesson_item):
             if lesson_item.agent_mode == "learn_agent":
                 artifact_data, lesson_usage = await self._generator.generate_artifact_for_lesson(
                     lesson_title=lesson_item.title,
@@ -979,10 +1242,7 @@ class LessonPipeline:
             bot_id = AgentBotId[lesson_item.agent_mode.upper()]
             template_id = lesson_item.template_id
 
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                total_token_usage[key] += lesson_usage.get(key, 0)
-
-            artifact_lessons.append({
+            return {
                 "lesson_id": lesson_id,
                 "bot_id": bot_id,
                 "title": lesson_item.title,
@@ -998,7 +1258,26 @@ class LessonPipeline:
                     "audio_specs": artifact_data.get("audio_specs", []),
                     "checkpoint_specs": _enrich_checkpoint_specs(artifact_data.get("checkpoint_specs", []), lesson_item.exercise_subtypes) if lesson_item.agent_mode == "learn_agent" else artifact_data.get("checkpoint_specs", []),
                 },
-            })
+                "_usage": lesson_usage,
+            }
+
+        # Run all lessons in parallel
+        results = await asyncio.gather(
+            *[generate_single_lesson(idx, lesson) for idx, lesson in enumerate(request.lessons, start=1)],
+            return_exceptions=True,
+        )
+
+        # Process results
+        artifact_lessons = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error("lesson_generation_failed", error=str(result))
+                continue
+            # Extract and accumulate token usage
+            lesson_usage = result.pop("_usage", {})
+            for key in ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens", "total_tokens"):
+                total_token_usage[key] += lesson_usage.get(key, 0)
+            artifact_lessons.append(result)
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -1006,7 +1285,7 @@ class LessonPipeline:
             "rejected": False,
             "reason_code": None,
             "reason": "",
-            "content": "Created lessons successfully",
+            "content": "Đã tạo bài học thành công",
             "lessons": artifact_lessons,
             "metadata": {
                 "request_id": request_id,
@@ -1024,11 +1303,10 @@ class LessonPipeline:
                 "expert_discussion_log": "",
                 "vision_extracted_text": None,
                 "token_usage": total_token_usage,
-                "cost_usd": estimate_cost(
-                    model="gpt-4.1",
-                    prompt_tokens=total_token_usage["prompt_tokens"],
-                    completion_tokens=total_token_usage["completion_tokens"],
-                ),
+                "cost_usd": _cost_from_usage("gpt-4.1", total_token_usage),
+                "cached_tokens": total_token_usage["cached_tokens"],
+                "cache_write_tokens": total_token_usage["cache_write_tokens"],
+                "cache_savings_usd": _cache_savings_from_usage("gpt-4.1", total_token_usage),
             },
         }
 
@@ -1045,6 +1323,7 @@ class LessonPipeline:
 
         return {"request_id": request_id, "status": "success", "data": data}
 
+    @observe(name="lesson_pipeline.stream_artifact_v3", capture_input=False, capture_output=False)
     async def stream_artifact_v3(
         self,
         request: GenerateArtifactRequest,
@@ -1060,7 +1339,7 @@ class LessonPipeline:
             yield _sse({
                 "phase": "started",
                 "request_id": request_id,
-                "message": f"Pika is creating artifacts for {total_lessons} lessons...",
+                "message": f"Pika đang tạo {total_lessons} bài học...",
                 "total_lessons": total_lessons,
                 "image_url": pipeline_image,
             }, "pipeline")
@@ -1091,26 +1370,31 @@ class LessonPipeline:
 
             yield _sse({
                 "phase": "profile",
-                "message": f"Profile fetched: {child_name or 'N/A'}",
+                "message": f"Đã lấy thông tin bé: {child_name or 'N/A'}",
                 "child_name": child_name,
                 "child_age": child_age,
                 "language": language,
                 "image_url": pipeline_image,
             }, "pipeline")
 
-            artifact_lessons = []
-            total_token_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            total_token_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0, "total_tokens": 0}
 
+            # OPTIMIZATION: Generate all lessons in PARALLEL, then yield in order
+            # This reduces total time from N*T to max(T1, T2, ..., TN)
+
+            # First, yield "started" events for all lessons
             for idx, lesson_item in enumerate(request.lessons, start=1):
                 yield _sse({
                     "phase": "lesson_started",
                     "index": idx,
                     "total": total_lessons,
                     "title": lesson_item.title,
-                    "message": f"Creating artifact {idx}/{total_lessons}: {lesson_item.title}",
+                    "message": f"Đang tạo bài {idx}/{total_lessons}: {lesson_item.title}",
                     "image_url": pipeline_image,
                 }, "artifact")
 
+            # Generate all lessons in parallel
+            async def generate_single(idx: int, lesson_item):
                 if lesson_item.agent_mode == "learn_agent":
                     artifact_data, lesson_usage = await self._generator.generate_artifact_for_lesson(
                         lesson_title=lesson_item.title,
@@ -1134,30 +1418,53 @@ class LessonPipeline:
                         custom_prompt=request.custom_talk_prompt,
                     )
 
-                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                    total_token_usage[key] += lesson_usage.get(key, 0)
-
                 lesson_id = f"lesson_{idx:03d}"
                 bot_id = AgentBotId[lesson_item.agent_mode.upper()]
                 template_id = lesson_item.template_id
 
-                artifact_lesson = {
-                    "lesson_id": lesson_id,
-                    "bot_id": bot_id,
-                    "title": lesson_item.title,
-                    "summary": artifact_data.get("summary", ""),
-                    "detail_tasks_lesson": artifact_data.get("detail_tasks_lesson", ""),
-                    "lesson_json": {
-                        "lesson_title": lesson_item.title,
-                        "agent_mode": lesson_item.agent_mode,
-                        "template_id": template_id,
-                        "runtime_bot_template": "PTL_LEARN_GENERIC_BOT_ID" if lesson_item.agent_mode == "learn_agent" else "PTL_TALK_GENERIC_BOT_ID",
-                        "system_task_description": artifact_data.get("system_task_description", ""),
-                        "card_specs": _enrich_card_specs(artifact_data.get("card_specs", []), lesson_item.exercise_subtypes) if lesson_item.agent_mode == "learn_agent" else artifact_data.get("card_specs", []),
-                        "audio_specs": artifact_data.get("audio_specs", []),
-                        "checkpoint_specs": _enrich_checkpoint_specs(artifact_data.get("checkpoint_specs", []), lesson_item.exercise_subtypes) if lesson_item.agent_mode == "learn_agent" else artifact_data.get("checkpoint_specs", []),
+                return {
+                    "idx": idx,
+                    "lesson_item": lesson_item,
+                    "artifact_lesson": {
+                        "lesson_id": lesson_id,
+                        "bot_id": bot_id,
+                        "title": lesson_item.title,
+                        "summary": artifact_data.get("summary", ""),
+                        "detail_tasks_lesson": artifact_data.get("detail_tasks_lesson", ""),
+                        "lesson_json": {
+                            "lesson_title": lesson_item.title,
+                            "agent_mode": lesson_item.agent_mode,
+                            "template_id": template_id,
+                            "runtime_bot_template": "PTL_LEARN_GENERIC_BOT_ID" if lesson_item.agent_mode == "learn_agent" else "PTL_TALK_GENERIC_BOT_ID",
+                            "system_task_description": artifact_data.get("system_task_description", ""),
+                            "card_specs": _enrich_card_specs(artifact_data.get("card_specs", []), lesson_item.exercise_subtypes) if lesson_item.agent_mode == "learn_agent" else artifact_data.get("card_specs", []),
+                            "audio_specs": artifact_data.get("audio_specs", []),
+                            "checkpoint_specs": _enrich_checkpoint_specs(artifact_data.get("checkpoint_specs", []), lesson_item.exercise_subtypes) if lesson_item.agent_mode == "learn_agent" else artifact_data.get("checkpoint_specs", []),
+                        },
                     },
+                    "usage": lesson_usage,
                 }
+
+            # Run all in parallel
+            results = await asyncio.gather(
+                *[generate_single(idx, lesson) for idx, lesson in enumerate(request.lessons, start=1)],
+                return_exceptions=True,
+            )
+
+            # Sort by idx and yield in order
+            artifact_lessons = []
+            valid_results = [r for r in results if not isinstance(r, Exception)]
+            valid_results.sort(key=lambda x: x["idx"])
+
+            for result in valid_results:
+                idx = result["idx"]
+                lesson_item = result["lesson_item"]
+                artifact_lesson = result["artifact_lesson"]
+                lesson_usage = result["usage"]
+
+                for key in ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens", "total_tokens"):
+                    total_token_usage[key] += lesson_usage.get(key, 0)
+
                 artifact_lessons.append(artifact_lesson)
 
                 yield _sse({
@@ -1175,7 +1482,7 @@ class LessonPipeline:
                 "rejected": False,
                 "reason_code": None,
                 "reason": "",
-                "content": "Created lessons successfully",
+                "content": "Đã tạo bài học thành công",
                 "lessons": artifact_lessons,
                 "metadata": {
                     "request_id": request_id,
@@ -1193,11 +1500,10 @@ class LessonPipeline:
                     "expert_discussion_log": "",
                     "vision_extracted_text": None,
                     "token_usage": total_token_usage,
-                    "cost_usd": estimate_cost(
-                        model="gpt-4.1",
-                        prompt_tokens=total_token_usage["prompt_tokens"],
-                        completion_tokens=total_token_usage["completion_tokens"],
-                    ),
+                    "cost_usd": _cost_from_usage("gpt-4.1", total_token_usage),
+                    "cached_tokens": total_token_usage["cached_tokens"],
+                    "cache_write_tokens": total_token_usage["cache_write_tokens"],
+                    "cache_savings_usd": _cache_savings_from_usage("gpt-4.1", total_token_usage),
                 },
             }
 
@@ -1212,6 +1518,7 @@ class LessonPipeline:
             yield _sse({"phase": "error", "message": str(exc)}, "error")
             yield "data: [DONE]\n\n"
 
+    @observe(name="lesson_pipeline.generate_regenerate", capture_input=False, capture_output=True)
     async def generate_regenerate(self, request: RegenerateLessonRequest, *, request_id: str) -> dict:
         start = time.monotonic()
 
@@ -1315,6 +1622,7 @@ class LessonPipeline:
     # ------------------------------------------------------------------
     # SSE Streaming mode
     # ------------------------------------------------------------------
+    @observe(name="lesson_pipeline.stream_generate", capture_input=True, capture_output=True)
     async def stream_generate(
         self,
         request: GenerateLessonRequest,
@@ -1332,7 +1640,7 @@ class LessonPipeline:
             custom_prompt = request.custom_prompt if request.custom_prompt is not None else (parent_config.custom_prompt if parent_config else None)
 
             pipeline_image = getattr(self._settings, "pipeline_robot_image_url", "") if self._settings else ""
-            yield _sse({"phase": "started", "request_id": request_id, "message": "Pika is analyzing request...", "image_url": pipeline_image}, "pipeline")
+            yield _sse({"phase": "started", "request_id": request_id, "message": "Pika đang phân tích yêu cầu...", "image_url": pipeline_image}, "pipeline")
 
             async def fetch_profile():
                 return await self._profile.fetch_profile(
@@ -1374,7 +1682,7 @@ class LessonPipeline:
 
             yield _sse({
                 "phase": "profile",
-                "message": f"Profile fetched: {user_profile.child.child_name if user_profile.child else 'N/A'}",
+                "message": f"Đã lấy thông tin bé: {user_profile.child.child_name if user_profile.child else 'N/A'}",
                 "child_name": user_profile.child.child_name if user_profile.child else None,
                 "child_age": user_profile.child.age if user_profile.child else None,
                 "language": user_profile.language_preference,
@@ -1383,7 +1691,7 @@ class LessonPipeline:
 
             yield _sse({
                 "phase": "memory",
-                "message": "Pika is searching for relevant information...",
+                "message": "Pika đang tìm kiếm thông tin liên quan đến bé và bài học...",
                 "facts": [f.text for f in memory.facts],
                 "image_url": pipeline_image,
             }, "pipeline")
@@ -1392,7 +1700,7 @@ class LessonPipeline:
                 preview = image_description[:100] + "..." if len(image_description) > 100 else image_description
                 yield _sse({
                     "phase": "vision_complete",
-                    "message": f"Extracted: {preview}",
+                    "message": f"Đã trích xuất: {preview}",
                     "vision_extracted_text": image_description,
                     "image_url": pipeline_image,
                 }, "pipeline")
@@ -1502,6 +1810,7 @@ class LessonPipeline:
             yield _sse({"phase": "error", "message": str(exc)}, "error")
             yield "data: [DONE]\n\n"
 
+    @observe(name="lesson_pipeline.stream_regenerate", capture_input=True, capture_output=True)
     async def stream_regenerate(
         self,
         request: RegenerateLessonRequest,
@@ -1519,7 +1828,7 @@ class LessonPipeline:
             custom_prompt = request.custom_prompt if request.custom_prompt is not None else (parent_config.custom_prompt if parent_config else None)
 
             pipeline_image = getattr(self._settings, "pipeline_robot_image_url", "") if self._settings else ""
-            yield _sse({"phase": "started", "request_id": request_id, "message": "Pika is regenerating lesson...", "image_url": pipeline_image}, "pipeline")
+            yield _sse({"phase": "started", "request_id": request_id, "message": "Pika đang tạo lại bài học...", "image_url": pipeline_image}, "pipeline")
 
             async def fetch_profile():
                 return await self._profile.fetch_profile(
@@ -1560,7 +1869,7 @@ class LessonPipeline:
 
             yield _sse({
                 "phase": "profile",
-                "message": f"Profile fetched: {user_profile.child.child_name if user_profile.child else 'N/A'}",
+                "message": f"Đã lấy thông tin bé: {user_profile.child.child_name if user_profile.child else 'N/A'}",
                 "child_name": user_profile.child.child_name if user_profile.child else None,
                 "child_age": user_profile.child.age if user_profile.child else None,
                 "language": user_profile.language_preference,
@@ -1569,7 +1878,7 @@ class LessonPipeline:
 
             yield _sse({
                 "phase": "memory",
-                "message": "Pika is searching for relevant information...",
+                "message": "Pika đang tìm kiếm thông tin liên quan đến bé và bài học...",
                 "facts": [f.text for f in memory.facts],
                 "image_url": pipeline_image,
             }, "pipeline")

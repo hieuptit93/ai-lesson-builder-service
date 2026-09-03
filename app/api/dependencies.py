@@ -29,16 +29,30 @@ def get_pipeline() -> LessonPipeline:
     if os.getenv("APP_PIPELINE_TYPE") == "mock":
         return MockPipeline()  # type: ignore
 
-    openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+    # max_retries: SDK auto-retries transient failures (429/5xx/connection)
+    # with exponential backoff. timeout bounds a single attempt.
+    openai_client = AsyncOpenAI(
+        api_key=settings.openai_api_key,
+        max_retries=2,
+        timeout=90.0,
+    )
 
     vision_adapter = OpenAIVisionAdapter(
         client=openai_client,
         model=settings.openai_vision_model,  # gpt-5.6-terra: quality vision extraction
         guardrail_model=settings.openai_guardrail_model,  # gpt-5.6-luna: ultra cheap guardrail
+        suggestions_model=settings.openai_suggestions_model,  # v3/lessons/generate: faster model
         temperature=settings.openai_vision_temperature,
         max_tokens=settings.openai_vision_max_tokens,
     )
-    extraction_service = ExtractionService(adapter=vision_adapter)
+    # model_name is the log/metric label; omitting it makes ExtractionService
+    # read the adapter's real model so the two cannot drift.
+    extraction_service = ExtractionService(
+        adapter=vision_adapter,
+        v3_parallel_images=settings.openai_v3_parallel_images,
+        v3_images_per_batch=settings.openai_v3_images_per_batch,
+        v3_max_concurrent=settings.openai_v3_max_concurrent,
+    )
 
     lesson_adapter = OpenAILessonAdapter(
         client=openai_client,

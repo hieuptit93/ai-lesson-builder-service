@@ -122,8 +122,12 @@ def get_langfuse_client():
         return None
 
 
-def get_langfuse_prompt(prompt_name: str) -> str | None:
+def get_langfuse_prompt(prompt_name: str, version: int | None = None) -> str | None:
     """Fetch a prompt from Langfuse by name.
+
+    Args:
+        version: Pin to a specific prompt version; None follows the
+                 production label (latest promoted version).
 
     Returns:
         Prompt content if found, None if not available or error.
@@ -141,7 +145,10 @@ def get_langfuse_prompt(prompt_name: str) -> str | None:
             )
             return None
 
-        prompt = langfuse.get_prompt(name=prompt_name)
+        if version:
+            prompt = langfuse.get_prompt(name=prompt_name, version=version)
+        else:
+            prompt = langfuse.get_prompt(name=prompt_name)
         if prompt:
             content = prompt.prompt if hasattr(prompt, 'prompt') else None
             if content:
@@ -185,10 +192,36 @@ def get_langfuse_prompt(prompt_name: str) -> str | None:
         return None
 
 
+_LESSON_PROMPT_SOURCE_CACHE: list = []  # cache: [] = unread, [value] = cached
+
+
+def _get_lesson_prompt_version_setting() -> int:
+    """langfuse_lesson_prompt_version from config (see config.py for values)."""
+    if not _LESSON_PROMPT_SOURCE_CACHE:
+        try:
+            from app.core.config import Settings
+            _LESSON_PROMPT_SOURCE_CACHE.append(Settings().langfuse_lesson_prompt_version)
+        except Exception:
+            _LESSON_PROMPT_SOURCE_CACHE.append(-1)  # default: local template
+    return _LESSON_PROMPT_SOURCE_CACHE[0]
+
+
 def _get_lesson_generation_prompt() -> str | None:
-    """Get lesson generation prompt template from Langfuse."""
+    """Get the lesson generation prompt template.
+
+    Source is controlled by langfuse_lesson_prompt_version:
+      -1 -> None (caller falls back to the LOCAL template, which is a verbatim
+            copy of what the deployed original service actually runs)
+       0 -> Langfuse production label (v55+ has strict rejection gates!)
+      >0 -> pinned Langfuse version
+    """
+    setting = _get_lesson_prompt_version_setting()
+    if setting < 0:
+        logger.info("lesson_prompt_source", source="local_template", reason="configured")
+        return None
     try:
-        langfuse_prompt = get_langfuse_prompt("persona_lesson_generation_prompt")
+        version = setting if setting > 0 else None
+        langfuse_prompt = get_langfuse_prompt("persona_lesson_generation_prompt", version=version)
         return langfuse_prompt
     except Exception:
         return None
@@ -321,15 +354,15 @@ You are a TEAM of 5 experts collaborating to create lessons for a child.
 You will think step-by-step, with each expert contributing their analysis BEFORE producing the final output.
 
 ## YOUR TEAM:
-- **[A] Image Analysis Expert**: Read and analyze content from image (image description), confirm topic, assess difficulty
-- **[B] Curriculum Design Expert**: Based on analysis from Image Analysis Expert, design 3 different lessons with different activity angles
-- **[C] Child Psychology Expert 6-12 years**: Review Curriculum Design Expert's plan, adjust language/difficulty based on child's age, add personalization
-- **[D] Safety Reviewer**: Check accuracy, age-appropriateness, flag issues
-- **[E] Final Editor**: Synthesize opinions from Child Psychology Expert and Safety Reviewer, create final JSON
+- **[A] Chuyên gia Phân tích Hình ảnh**: Đọc và phân tích nội dung từ ảnh (image description), xác nhận chủ đề, đánh giá độ khó
+- **[B] Chuyên gia Thiết kế Giáo trình**: Dựa trên phân tích của Chuyên gia Phân tích Hình ảnh, thiết kế 3 bài học khác nhau với các góc độ hoạt động khác nhau
+- **[C] Chuyên gia Tâm lý Trẻ em 6-12 tuổi**: Xem xét kế hoạch của Chuyên gia Thiết kế Giáo trình, điều chỉnh ngôn ngữ/độ khó theo tuổi trẻ, thêm cá nhân hóa
+- **[D] Kiểm duyệt viên An toàn**: Kiểm tra tính chính xác, sự phù hợp lứa tuổi, đánh dấu các vấn đề
+- **[E] Tổng biên tập**: Tổng hợp ý kiến từ Chuyên gia Tâm lý Trẻ em và Kiểm duyệt viên An toàn, tạo JSON cuối cùng
 
 ---
 
-## INPUT DATA:
+## DỮ LIỆU ĐẦU VÀO:
 
 ### IMAGE DESCRIPTION (from Vision Model):
 {RAW_TEXT}
@@ -349,43 +382,103 @@ You will think step-by-step, with each expert contributing their analysis BEFORE
 
 ---
 
-## RULES:
+## QUY TẮC:
 
-### Discussion rules
-1. MUST have all 5 parts in exact order [A] -> [B] -> [C] -> [D] -> [E]
-2. Each expert [A]-[D] writes exactly 2 analysis sentences in Vietnamese. [E] ONLY returns JSON, no analysis.
-3. ALL content (analysis and output) MUST be in Vietnamese.
+### Quy tắc thảo luận
+1. BẮT BUỘC ĐỦ 5 phần và theo chính xác thứ tự [A] → [B] → [C] → [D] → [E]
+2. Mỗi chuyên gia [A]-[D] viết đúng 2 câu phân tích bằng tiếng Việt. [E] CHỈ trả JSON, không viết phân tích.
+3. TOÀN BỘ nội dung (phân tích lẫn output) PHẢI bằng tiếng Việt.
+4. Khi nhắc đến nhau TRONG NỘI DUNG phân tích, PHẢI gọi bằng TÊN ĐẦY ĐỦ (ví dụ: "Chuyên gia Phân tích Hình ảnh", "Kiểm duyệt viên An toàn"...). KHÔNG viết "A đề xuất...", "theo B...". Chỉ giữ [A]-[E] ở dòng header mở đầu.
+5. Chuyên gia sau PHẢI tham chiếu và sửa lỗi chuyên gia trước nếu cần.
 
-### Lesson content rules
-6. Create 3 DIFFERENT lessons, each exploring a different aspect of the topic.
-7. Each lesson must have: lesson_id, title, summary, detail_tasks_lesson, prompt_agent.
+### Quy tắc nội dung bài học
+6. Tạo 3 bài học KHÁC NHAU, mỗi bài khai thác một khía cạnh khác nhau của chủ đề.
+7. Mỗi bài học phải có đủ: lesson_id, title, summary, detail_tasks_lesson, prompt_agent.
+8. summary: Tóm tắt ngắn gọn 1-2 câu về bài học.
+9. detail_tasks_lesson: Đoạn text gồm 3 hoạt động cụ thể (Hoạt động 1: ..., Hoạt động 2: ..., Hoạt động 3: ...).
+10. prompt_agent: Chain-of-Draft for Pika — 5-7 lines (D1–D7) covering ALL 3 activities, ending with → GOAL.
+Format: D1: <step> \n D2: <step> \n ... \n → GOAL: <outcome>
+Rules by lesson type:
++, Math (Draft-of-Solution): The draft IS the complete worked solution. Each D-line that involves calculation MUST contain: the operation + actual numbers + intermediate result (e.g., "mười hai chia năm được hai dư hai"). → ANSWER line is MANDATORY with the verified final result. NEVER delegate calculation to chatbot runtime. NEVER use vague steps like "hỏi trẻ làm bước tiếp" or "tiếp tục từng số" — every step must be pre-solved.
 
-Output ONLY valid JSON when CONTENT IS SAFE:
+11. Sử dụng ngôn ngữ ấm áp, thân thiện, khích lệ, phù hợp trẻ 6-12 tuổi.
+12. Trong "prompt_agent" và "summary", LUÔN dùng "Pika" thay cho "agent".
+13. Nếu bài học là dạng DẠY TỪ VỰNG, BẮT BUỘC liệt kê các từ vựng sẽ dạy trong "detail_tasks_lesson" (tối đa 5 từ).
+
+### Quy tắc Pika — chỉ dạy qua giọng nói
+14. Pika dạy HOÀN TOÀN qua GIỌNG NÓI và HỘI THOẠI. TUYỆT ĐỐI KHÔNG đề cập nhìn hình, xem ảnh, xem video, nhìn màn hình trong BẤT KỲ trường nào. Thay vào đó dùng: "Pika mô tả...", "Pika kể...", "lắng nghe Pika...", "đoán xem...". KHÔNG đề cập dạy phát âm hay luyện phát âm.
+
+### Quy tắc kiểm duyệt
+15. Kiểm duyệt viên An toàn PHẢI đánh dấu mọi sai sót về kiến thức.
+16. Chuyên gia Tâm lý Trẻ em PHẢI điều chỉnh độ phức tạp theo tuổi và lịch sử học tập của trẻ. (Nếu không có thông tin về tuổi, lấy mặc định là 6-12 tuổi)
+17. TUYỆT ĐỐI KHÔNG chứa nội dung bạo lực, đáng sợ, hoặc không phù hợp trẻ em.
+
+---
+
+## AN TOÀN NỘI DUNG — TỪ CHỐI ĐẦU VÀO:
+Nếu IMAGE DESCRIPTION chứa BẤT KỲ nội dung nào sau đây, KHÔNG tạo bài học:
+- Bạo lực, vũ khí, máu me, chết chóc, chiến tranh
+- Nội dung tình dục hoặc 18+
+- Ma túy, rượu bia, thuốc lá
+- Phát ngôn thù ghét, phân biệt đối xử, phân biệt chủng tộc
+- Tự gây thương tích, tự tử
+- Kinh dị, đáng sợ
+- Cờ bạc
+- Nội dung rõ ràng không liên quan đến giáo dục trẻ em
+→ Chuyên gia Phân tích Hình ảnh tuyên bố từ chối, các expert xác nhận, Tổng biên tập trả rejection JSON.
+
+Nếu IMAGE DESCRIPTION không được mô tả → Chuyên gia Phân tích Hình ảnh thông báo "phụ huynh không gửi kèm hình ảnh" và luồng tiếp tục
+
+---
+
+## BẮT ĐẦU — Viết đủ 5 phần [A] → [B] → [C] → [D] → [E]:
+
+**[A] Chuyên gia Phân tích Hình ảnh:**
+(Phân tích image description: xác nhận chủ đề, đánh giá nội dung phù hợp cho trẻ. Nếu vi phạm An toàn Nội dung → tuyên bố từ chối.)
+
+**[B] Chuyên gia Thiết kế Giáo trình:**
+(Dựa trên phân tích của Chuyên gia Phân tích Hình ảnh, đề xuất 3 bài học khác nhau. Nếu dạng từ vựng, liệt kê tối đa 5 từ. KHÔNG đề cập nhìn hình/xem ảnh.)
+
+**[C] Chuyên gia Tâm lý Trẻ em:**
+(Xem xét kế hoạch của Chuyên gia Thiết kế Giáo trình, điều chỉnh theo tuổi trẻ, thêm cá nhân hóa từ memory.)
+
+**[D] Kiểm duyệt viên An toàn:**
+(Kiểm tra tính chính xác, đánh dấu vấn đề, kiểm tra sự phù hợp lứa tuổi.)
+
+**[E] Tổng biên tập:**
+(Tổng hợp tất cả phản hồi, ONLY return JSON cuối cùng với đủ 5 keys.)
+
+Khi NỘI DUNG AN TOÀN:
 ```json
 {{
   "rejected": false,
   "reason_code": null,
   "reason": "",
-  "content": "Created lessons successfully",
+  "content": "Đã tạo bài học thành công",
   "lessons": [
-    {{ "lesson_id": "lesson_001", "title": "Lesson title 1", "summary": "Summary 1-2 sentences", "detail_tasks_lesson": "Activity 1: ...\\nActivity 2: ...\\nActivity 3: ...", "prompt_agent": "D1: step\\nD2: step\\n-> GOAL: outcome" }},
-    {{ "lesson_id": "lesson_002", "title": "Lesson title 2", "summary": "Summary 1-2 sentences", "detail_tasks_lesson": "Activity 1: ...\\nActivity 2: ...\\nActivity 3: ...", "prompt_agent": "D1: step\\nD2: step\\n-> GOAL: outcome" }},
-    {{ "lesson_id": "lesson_003", "title": "Lesson title 3", "summary": "Summary 1-2 sentences", "detail_tasks_lesson": "Activity 1: ...\\nActivity 2: ...\\nActivity 3: ...", "prompt_agent": "D1: step\\nD2: step\\n-> GOAL: outcome" }}
-  ]
+    {{ "lesson_id": "lesson_001", "title": "Tên bài học 1 (ngắn gọn, hấp dẫn)", "summary": "Nội dung tóm tắt bài học 1 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ]" }},
+    {{ "lesson_id": "lesson_002", "title": "Tên bài học 2", "summary": "Nội dung tóm tắt bài học 2 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ]" }},
+    {{ "lesson_id": "lesson_003", "title": "Tên bài học 3", "summary": "Nội dung tóm tắt bài học 3 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ]" }}
+  ]  
 }}
 ```
+(Chú ý về dạng bài học: 
++, Nếu bài học liên quan đến dạy từ vựng, thì trong mô tả hoạt động sẽ liệt kê các từ vựng sẽ dạy, lưu ý là tối đa 5 từ)
 
-When CONTENT IS UNSAFE:
+
+Khi NỘI DUNG KHÔNG AN TOÀN:
 ```json
 {{
   "rejected": true,
   "reason_code": "unsafe_content",
-  "reason": "[Rejection reason in Vietnamese]",
-  "content": "Refused to create lesson",
+  "reason": "[Lý do từ chối bằng tiếng Việt]",
+  "content": "Từ chối tạo bài học",
   "lessons": []
 }}
 ```
-"""
+
+KHÔNG tạo bài học khi reject. KHÔNG trích xuất phần an toàn từ nội dung không an toàn.
+```"""
 
 
 def build_lesson_prompt(
@@ -442,6 +535,110 @@ Use these facts to personalize the lesson (e.g., use child's interests as exampl
         PARENT_SECTION=parent_section,
         TEMPLATE_TEXT=template_text,
     )
+
+
+# Markers bounding the ONLY dynamic section of the generation prompt.
+# Everything outside this section is static rules -> cacheable by OpenAI.
+_INPUT_SECTION_START = "## DỮ LIỆU ĐẦU VÀO:"
+_INPUT_SECTION_END = "## QUY TẮC:"
+
+
+def build_lesson_prompt_split(
+    *,
+    extracted_content: dict,
+    subject: str,
+    purpose: str,
+    language: str,
+    memory_facts: list | None = None,
+    parent_notes: str | None = None,
+    child_age: int | None = None,
+    child_name: str | None = None,
+) -> tuple[str | None, str]:
+    """Build (system_prompt, user_prompt) for prompt caching.
+
+    The generation template keeps ALL its dynamic placeholders inside one
+    "## DỮ LIỆU ĐẦU VÀO:" section. Splitting there lets the static rules
+    (~63KB, ~16K tokens) go into the system message, which OpenAI caches
+    automatically (>1024 tokens): up to 80% faster TTFT and 90% cheaper
+    cached input on repeat calls. Content is identical to build_lesson_prompt,
+    only the message layout changes.
+
+    Returns:
+        (system_prompt, user_prompt). system_prompt is None when the template
+        cannot be split - caller should fall back to single-prompt generate().
+    """
+    template_list = get_template(subject)
+    template_text = _format_template(template_list)
+
+    memory_section = ""
+    if memory_facts:
+        facts_text = "\n".join(f"- {f.text}" for f in memory_facts)
+        memory_section = f"""
+## CHILD MEMORY (from Mem0 - personalization data):
+{facts_text}
+Use these facts to personalize the lesson (e.g., use child's interests as examples, adjust difficulty based on history).
+"""
+
+    parent_section = ""
+    parts = []
+    if child_name:
+        parts.append(f"Child name: {child_name}")
+    if child_age:
+        parts.append(f"Child age: {child_age}")
+    if parent_notes:
+        parts.append(f"Parent request: {parent_notes}")
+    if parts:
+        parent_section = "\n## PARENT INPUT:\n" + "\n".join(f"- {p}" for p in parts) + "\n"
+
+    raw_text = extracted_content.get("raw_text", "")
+    topic = extracted_content.get("topic_detected", subject)
+
+    language_instruction = _get_language_prompt(language)
+
+    prompt_template = _get_lesson_generation_prompt()
+    if prompt_template is None:
+        prompt_template = PERSONA_LESSON_GENERATION_PROMPT_TEMPLATE
+
+    fmt_args = dict(
+        LANGUAGE_INSTRUCTION=language_instruction,
+        RAW_TEXT=raw_text,
+        TOPIC=topic,
+        SUBJECT=subject,
+        PURPOSE=purpose,
+        LANGUAGE=language,
+        MEMORY_SECTION=memory_section,
+        PARENT_SECTION=parent_section,
+        TEMPLATE_TEXT=template_text,
+    )
+
+    start = prompt_template.find(_INPUT_SECTION_START)
+    end = prompt_template.find(_INPUT_SECTION_END)
+
+    if start == -1 or end == -1 or end <= start:
+        # Template layout changed - can't split safely. Fall back to full prompt.
+        logger.warning(
+            "lesson_prompt_split_fallback",
+            reason="input_section_markers_not_found",
+            has_start=start != -1,
+            has_end=end != -1,
+        )
+        return None, prompt_template.format(**fmt_args)
+
+    static_intro = prompt_template[:start]
+    dynamic_template = prompt_template[start:end]
+    static_rules = prompt_template[end:]
+
+    # Static parts skip .format(), so unescape the {{ }} JSON examples manually.
+    system_prompt = (static_intro + static_rules).replace("{{", "{").replace("}}", "}")
+    user_prompt = dynamic_template.format(**fmt_args)
+
+    logger.info(
+        "lesson_prompt_split",
+        system_chars=len(system_prompt),
+        user_chars=len(user_prompt),
+        est_cacheable_tokens=len(system_prompt) // 4,
+    )
+    return system_prompt, user_prompt
 
 
 LEARN_AGENT_SYSTEM_TASK_PROMPT_TEMPLATE = """

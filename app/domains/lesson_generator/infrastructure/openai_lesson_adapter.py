@@ -73,6 +73,98 @@ class OpenAILessonAdapter:
         )
         return text, usage
 
+    @observe(name="lesson_llm_call_cached", capture_input=True, capture_output=True)
+    async def generate_split(self, system_prompt: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
+        """Generate with static system + dynamic user messages for prompt caching.
+
+        The system message carries the static rules (~16K tokens) which OpenAI
+        caches automatically; only the small user message varies per request.
+        Cache hits cut TTFT by up to 80% and cached input cost by 90%.
+        """
+        logger.info(
+            "lesson_api_call_cached",
+            model=self._model,
+            system_chars=len(system_prompt),
+            user_chars=len(user_prompt),
+        )
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            prompt_cache_key=_prompt_cache_key(system_prompt),
+        )
+        text = response.choices[0].message.content or ""
+        usage = _usage_dict(response)
+
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        logger.info(
+            "lesson_api_response_cached",
+            tokens_used=usage.get("total_tokens", 0),
+            cached_tokens=usage.get("cached_tokens", 0),
+            cache_hit_ratio=(
+                round(usage.get("cached_tokens", 0) / prompt_tokens, 3) if prompt_tokens else 0.0
+            ),
+        )
+        return text, usage
+
+    @observe(name="lesson_llm_stream_cached", capture_input=True, capture_output=True)
+    async def stream_generate_split(
+        self, system_prompt: str, user_prompt: str
+    ) -> AsyncGenerator[tuple[str, dict[str, Any] | None], None]:
+        """Stream generation with static system + dynamic user messages.
+
+        Yields (chunk, None) for each text delta, then ("", usage_dict) once
+        at the end when the API reports final usage. Same prompt-caching
+        benefits as generate_split.
+        """
+        logger.info(
+            "lesson_api_stream_cached",
+            model=self._model,
+            system_chars=len(system_prompt),
+            user_chars=len(user_prompt),
+        )
+        stream = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            prompt_cache_key=_prompt_cache_key(system_prompt),
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        final_usage: dict[str, Any] = {}
+        async for chunk in stream:
+            if chunk.usage:  # final chunk carries usage when include_usage is set
+                details = getattr(chunk.usage, "prompt_tokens_details", None)
+                final_usage = {
+                    "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                    "completion_tokens": chunk.usage.completion_tokens or 0,
+                    "cached_tokens": getattr(details, "cached_tokens", 0) or 0,
+                    "total_tokens": chunk.usage.total_tokens or 0,
+                }
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                yield delta.content, None
+
+        prompt_tokens = final_usage.get("prompt_tokens", 0)
+        logger.info(
+            "lesson_api_stream_cached_done",
+            tokens_used=final_usage.get("total_tokens", 0),
+            cached_tokens=final_usage.get("cached_tokens", 0),
+            cache_hit_ratio=(
+                round(final_usage.get("cached_tokens", 0) / prompt_tokens, 3) if prompt_tokens else 0.0
+            ),
+        )
+        yield "", final_usage
+
     @observe(name="lesson_llm_stream", capture_input=True, capture_output=True)
     async def stream_generate(self, prompt: str) -> AsyncGenerator[tuple[str, dict[str, Any]], None]:
         """Stream generate - yields (chunk, usage_dict)."""

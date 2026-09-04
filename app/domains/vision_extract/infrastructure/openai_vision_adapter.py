@@ -124,7 +124,8 @@ class _LessonStreamScanner:
                 if self._depth == 0 and self._obj_start != -1:
                     chunk = self._buf[self._obj_start : self._pos + 1]
                     try:
-                        completed.append(json.loads(chunk))
+                        # strict=False: tolerate literal newlines in strings
+                        completed.append(json.loads(chunk, strict=False))
                     except json.JSONDecodeError:
                         logger.warning("lesson_stream_parse_failed", chunk_preview=chunk[:120])
                     self._obj_start = -1
@@ -241,6 +242,7 @@ class OpenAIVisionAdapter:
         model: str = "gpt-5.6-terra",  # Vision: $2/1M in, $12/1M out - quality/cost balance
         guardrail_model: str = "gpt-5.6-luna",  # Guardrail: $0.20/1M in - ultra cheap with built-in safety
         suggestions_model: str | None = None,  # v3/lessons/generate; defaults to `model`
+        v1_extraction_model: str | None = None,  # v1 extract(): plain describe - faster model OK
         temperature: float = 0.0,
         max_tokens: int = 32768,
     ):
@@ -250,6 +252,9 @@ class OpenAIVisionAdapter:
         # v3 suggestions only need page segmentation + template choice, so this
         # can be a smaller/faster model than full extraction.
         self._suggestions_model = suggestions_model or model
+        # v1 extraction is a simple describe/OCR step feeding the 5-expert
+        # generation prompt - GPT-4.1 streams output ~2.5x faster than Terra.
+        self._v1_extraction_model = v1_extraction_model or model
         self._temperature = temperature
         self._max_tokens = max_tokens
         # Shared HTTP client: one connection pool, no per-download TLS handshake
@@ -396,19 +401,27 @@ class OpenAIVisionAdapter:
         content: list[dict] = [{"type": "input_text", "text": prompt}]
         content += await self._build_image_content(image_urls, "full")
 
-        logger.info("vision_api_call", model=self._model, image_count=len(image_urls))
+        model = self._v1_extraction_model
+        logger.info("vision_api_call", model=model, image_count=len(image_urls))
         _warn_if_uncacheable(prompt, "extract")
+
+        request_kwargs: dict[str, Any] = {
+            "model": model,
+            "input": [{"role": "user", "content": content}],
+            "max_output_tokens": self._max_tokens,
+            "prompt_cache_key": _prompt_cache_key(prompt),
+        }
+        # reasoning "none": extraction is deterministic OCR/describe work -
+        # hidden reasoning tokens only add latency. Only GPT-5.6 models accept
+        # the reasoning parameter (GPT-4.x rejects it).
+        if model.startswith("gpt-5"):
+            request_kwargs["reasoning"] = {"effort": "none"}
 
         import time as _time
         _llm_start = _time.monotonic()
         try:
             # GPT-5.6 models don't support temperature parameter
-            response = await self._client.responses.create(
-                model=self._model,
-                input=[{"role": "user", "content": content}],
-                max_output_tokens=self._max_tokens,
-                prompt_cache_key=_prompt_cache_key(prompt),
-            )
+            response = await self._client.responses.create(**request_kwargs)
         except Exception as exc:  # noqa: BLE001
             self._emit_llm("error", _llm_start, error_type=type(exc).__name__)
             raise
@@ -512,26 +525,41 @@ class OpenAIVisionAdapter:
         }
 
     @observe(name="vision_llm_call_v3", capture_input=True, capture_output=True)
-    async def extract_v3(self, image_urls: list[str], prompt: str) -> tuple[dict, dict[str, Any]]:
+    async def extract_v3(
+        self,
+        image_urls: list[str],
+        prompt: str,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> tuple[dict, dict[str, Any]]:
         """Extract structured content from images - returns (parsed_dict, usage) tuple.
 
         Returns FULL lesson format matching source system:
         - rejected, reason_code, reason, content (root fields)
         - lessons array with: title, summary, detail_tasks_lesson, prompt_agent, agent_mode, options, content
+
+        Args:
+            reasoning_effort: Optional reasoning effort level ("minimal", "low", "medium", "high").
+                             Use "minimal" for fast extraction tasks to reduce latency.
         """
         content: list[dict] = [{"type": "input_text", "text": prompt}]
         content += await self._build_image_content(image_urls, "full")
 
-        logger.info("vision_api_call_v3", model=self._model, image_count=len(image_urls))
+        logger.info("vision_api_call_v3", model=self._model, image_count=len(image_urls), reasoning_effort=reasoning_effort)
         _warn_if_uncacheable(prompt, "extract_v3")
 
-        response = await self._client.responses.create(
-            model=self._model,
-            input=[{"role": "user", "content": content}],
-            max_output_tokens=self._max_tokens,
-            prompt_cache_key=_prompt_cache_key(prompt),
-            text=_LESSONS_TEXT_FORMAT,
-        )
+        # Build request kwargs - add reasoning_effort if specified
+        request_kwargs: dict[str, Any] = {
+            "model": self._model,
+            "input": [{"role": "user", "content": content}],
+            "max_output_tokens": self._max_tokens,
+            "prompt_cache_key": _prompt_cache_key(prompt),
+            "text": _LESSONS_TEXT_FORMAT,
+        }
+        if reasoning_effort:
+            request_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+        response = await self._client.responses.create(**request_kwargs)
 
         raw_text = response.output_text or ""
         usage = self._usage_dict(response)
@@ -553,6 +581,80 @@ class OpenAIVisionAdapter:
             logger.info("vision_v3_json_keys", keys=list(result.keys()) if isinstance(result, dict) else "not_a_dict")
         except json.JSONDecodeError:
             logger.warning("vision_v3_json_parse_failed", raw_text_preview=raw_text[:200])
+            from app.core.exceptions import VisionExtractionError
+            raise VisionExtractionError(
+                "Vision model returned invalid JSON",
+                raw_response=raw_text[:500],
+            )
+
+        return result, usage
+
+    @observe(name="vision_llm_call_v3_cached", capture_input=True, capture_output=True)
+    async def extract_v3_cached(
+        self,
+        image_urls: list[str],
+        system_prompt: str,
+        user_prompt: str,
+    ) -> tuple[dict, dict[str, Any]]:
+        """Extract with SYSTEM + USER prompts for optimal prompt caching.
+
+        The system prompt is static and cached by OpenAI when it exceeds ~1024 tokens.
+        This can reduce TTFT by up to 80% and input costs by up to 90%.
+
+        Args:
+            image_urls: List of image URLs to analyze
+            system_prompt: Static system instructions (should be >1024 tokens for caching)
+            user_prompt: Dynamic per-request content (subject, memory, etc.)
+        """
+        # Build user content with images
+        user_content: list[dict] = [{"type": "input_text", "text": user_prompt}]
+        user_content += await self._build_image_content(image_urls, "full")
+
+        logger.info(
+            "vision_api_call_v3_cached",
+            model=self._model,
+            image_count=len(image_urls),
+            system_prompt_chars=len(system_prompt),
+            user_prompt_chars=len(user_prompt),
+        )
+
+        # System prompt should be cacheable (>1024 tokens)
+        system_tokens_est = len(system_prompt) // 4
+        if system_tokens_est < 1024:
+            logger.warning(
+                "prompt_cache_may_not_trigger",
+                system_tokens_est=system_tokens_est,
+                min_required=1024,
+            )
+
+        response = await self._client.responses.create(
+            model=self._model,
+            instructions=system_prompt,  # System prompt - cached by OpenAI
+            input=[{"role": "user", "content": user_content}],
+            max_output_tokens=self._max_tokens,
+            prompt_cache_key=_prompt_cache_key(system_prompt),  # Stable cache key
+            text=_LESSONS_TEXT_FORMAT,
+        )
+
+        raw_text = response.output_text or ""
+        usage = self._usage_dict(response)
+        self._log_cache("extract_v3_cached", usage)
+
+        logger.info(
+            "vision_api_response_v3_cached",
+            tokens_used=usage.get("total_tokens", 0),
+            cached_tokens=usage.get("cached_tokens", 0),
+            output_text_length=len(raw_text),
+            has_output=bool(response.output),
+        )
+
+        self._check_truncation(response, raw_text, usage)
+
+        try:
+            result = json.loads(raw_text.strip())
+            logger.info("vision_v3_cached_json_keys", keys=list(result.keys()) if isinstance(result, dict) else "not_a_dict")
+        except json.JSONDecodeError:
+            logger.warning("vision_v3_cached_json_parse_failed", raw_text_preview=raw_text[:200])
             from app.core.exceptions import VisionExtractionError
             raise VisionExtractionError(
                 "Vision model returned invalid JSON",

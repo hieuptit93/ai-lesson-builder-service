@@ -42,6 +42,7 @@ def get_pipeline() -> LessonPipeline:
         model=settings.openai_vision_model,  # gpt-5.6-terra: quality vision extraction
         guardrail_model=settings.openai_guardrail_model,  # gpt-5.6-luna: ultra cheap guardrail
         suggestions_model=settings.openai_suggestions_model,  # v3/lessons/generate: faster model
+        v1_extraction_model=settings.openai_v1_extraction_model,  # v1 describe step: gpt-4.1 ~2.5x faster output
         temperature=settings.openai_vision_temperature,
         max_tokens=settings.openai_vision_max_tokens,
     )

@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # GPT-5.6 Terra: $2/1M input, 128K output, Feb 2026 knowledge
     # Using Structured Outputs with strict schema - decoder enforced compliance
     openai_vision_model: str = "gpt-5.6-terra"
+    # V1 extract_from_images only: plain describe/OCR feeding the strong
+    # GPT-4.1 generation step. Terra measured ~67 output tok/s vs GPT-4.1
+    # ~170 tok/s - for a ~700 token description that's 10s vs ~4s, and the
+    # downstream 5-expert prompt does the heavy pedagogy anyway.
+    openai_v1_extraction_model: str = "gpt-4.1"
     # GPT-5.6 Luna: $0.20/1M input - ultra cheap for guardrail
     openai_guardrail_model: str = "gpt-5.6-luna"
     # Enable guardrail for custom "educational value" check
@@ -75,6 +80,16 @@ class Settings(BaseSettings):
     langfuse_base_url: str = "https://cloud.langfuse.com"
     langfuse_sample_rate: float = 1.0
     langfuse_tracing_enabled: bool = True
+    # Source for persona_lesson_generation_prompt:
+    #   -1 = LOCAL template in prompt_builder.py (6.7KB, no rejection gates -
+    #        matches observed production behavior)
+    #    0 = Langfuse latest (production label, currently v79). NOTE: v55+
+    #        has strict rejection gates (not_found/source_conflict when
+    #        custom_prompt doesn't match the image). With our split
+    #        system/user layout these gates actually ENFORCE - unlike the
+    #        original's single-message layout where the model ignores them.
+    #   >0 = pinned Langfuse version
+    langfuse_lesson_prompt_version: int = 0
 
     # Delay between SSE phases (seconds). Default 0.0 for production.
     # Set > 0 only for debugging/demo to visualize progress.

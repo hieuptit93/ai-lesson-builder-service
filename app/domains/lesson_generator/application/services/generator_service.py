@@ -12,6 +12,7 @@ from app.domains.lesson_generator.application.services.prompt_builder import (
     _TALK_AGENT_S0_S1,
     build_artifact_prompt,
     build_lesson_prompt,
+    build_lesson_prompt_split,
     build_regenerate_lesson_prompt,
     build_talk_agent_section_2,
     build_talk_agent_sections_3_to_5_from_json,
@@ -37,9 +38,11 @@ _EXPERT_MAP = {
 
 
 def _extract_json_from_text(text: str) -> dict:
+    # strict=False: GPT sometimes emits literal newlines inside string values
+    # (e.g. multi-line prompt_agent) - valid intent, invalid strict JSON.
     json_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
     if json_match:
-        return json.loads(json_match.group(1))
+        return json.loads(json_match.group(1), strict=False)
 
     last_brace = text.rfind("}")
     if last_brace == -1:
@@ -59,7 +62,7 @@ def _extract_json_from_text(text: str) -> dict:
     if start == -1:
         raise ValueError("No balanced JSON object found")
 
-    return json.loads(text[start : last_brace + 1])
+    return json.loads(text[start : last_brace + 1], strict=False)
 
 
 def _extract_expert_sections(text: str) -> list[tuple[str, str]]:
@@ -113,7 +116,9 @@ class GeneratorService:
     ) -> tuple[str, dict]:
         start = time.monotonic()
 
-        prompt = build_lesson_prompt(
+        # Split into (static system, dynamic user) so OpenAI caches the ~16K
+        # token rules section. Content identical to build_lesson_prompt.
+        system_prompt, user_prompt = build_lesson_prompt_split(
             extracted_content=extracted_content,
             subject=subject,
             purpose=purpose,
@@ -133,10 +138,14 @@ class GeneratorService:
             target_endpoint="https://api.openai.com/v1/chat/completions",
             http_method="POST",
             model=self._model_name,
-            input_content=_extract_user_message(prompt),
+            input_content=_extract_user_message(user_prompt),
         )
 
-        raw_response, usage = await self._adapter.generate(prompt)
+        if system_prompt:
+            raw_response, usage = await self._adapter.generate_split(system_prompt, user_prompt)
+        else:
+            # Template couldn't be split - user_prompt is the full prompt
+            raw_response, usage = await self._adapter.generate(user_prompt)
         expert_sections = _extract_expert_sections(raw_response)
         expert_log = "\n".join(content for _, content in expert_sections)
         lesson_plan = _extract_json_from_text(raw_response)
@@ -162,6 +171,93 @@ class GeneratorService:
         )
 
         return expert_log, lesson_plan
+
+    @observe(name="lesson_generation_stream", capture_input=False, capture_output=False)
+    async def stream_generate_lesson_v2(
+        self,
+        *,
+        extracted_content: dict,
+        subject: str,
+        purpose: str,
+        language: str,
+        memory_facts: list | None = None,
+        parent_notes: str | None = None,
+        child_age: int | None = None,
+        child_name: str | None = None,
+    ) -> AsyncGenerator[tuple[str, object], None]:
+        """Streaming version of generate_lesson for the v1 SSE flow.
+
+        Yields ("lesson", lesson_dict) the moment each lesson object completes
+        in the streamed JSON, then ("complete", (lesson_plan, usage)) with the
+        authoritative full parse. Same prompt/model/quality as generate_lesson.
+        """
+        from app.domains.vision_extract.infrastructure.openai_vision_adapter import _LessonStreamScanner
+
+        start = time.monotonic()
+
+        system_prompt, user_prompt = build_lesson_prompt_split(
+            extracted_content=extracted_content,
+            subject=subject,
+            purpose=purpose,
+            language=language,
+            memory_facts=memory_facts,
+            parent_notes=parent_notes,
+            child_age=child_age,
+            child_name=child_name,
+        )
+
+        logger.info(
+            "external.api.start",
+            log_type="external_api",
+            feature="LLM",
+            target_service="openai",
+            target_endpoint="https://api.openai.com/v1/chat/completions",
+            http_method="POST",
+            model=self._model_name,
+            mode="v1_stream_2call",
+        )
+
+        scanner = _LessonStreamScanner()
+        full_text = ""
+        usage: dict = {}
+
+        if system_prompt:
+            stream = self._adapter.stream_generate_split(system_prompt, user_prompt)
+        else:
+            # Fallback: template unsplittable - stream with the full prompt
+            async def _wrap():
+                async for chunk, u in self._adapter.stream_generate(user_prompt):
+                    yield chunk, None
+                yield "", {}
+            stream = _wrap()
+
+        async for chunk, final_usage in stream:
+            if final_usage is not None:
+                usage = final_usage
+                continue
+            full_text += chunk
+            for lesson in scanner.feed(chunk):
+                yield "lesson", lesson
+
+        lesson_plan = _extract_json_from_text(full_text)
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        logger.info(
+            "external.api.success",
+            log_type="external_api",
+            feature="LLM",
+            target_service="openai",
+            model=self._model_name,
+            status_code=200,
+            duration_ms=elapsed_ms,
+            mode="v1_stream_2call",
+            lessons_count=len(lesson_plan.get("lessons", [])),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            cached_tokens=usage.get("cached_tokens", 0),
+        )
+
+        yield "complete", (lesson_plan, usage)
 
     @observe(name="lesson_regeneration", capture_input=True, capture_output=True)
     async def generate_regenerate_lesson(

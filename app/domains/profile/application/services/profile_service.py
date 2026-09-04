@@ -9,6 +9,15 @@ from langfuse import observe
 from app.domains.profile.domain.entities import ChildProfile, UserProfile
 from app.domains.profile.infrastructure.profile_client import ProfileClient, ProfileClientError
 
+# Alert system (graceful fallback if not configured)
+try:
+    from app.infrastructure.alerts.helpers.send_alert_safe import send_alert_safe
+    from app.infrastructure.alerts.alert_types import AlertType, AlertLevel
+except ImportError:
+    send_alert_safe = lambda **kwargs: None  # noqa: E731
+    AlertType = None
+    AlertLevel = None
+
 logger = structlog.get_logger()
 
 
@@ -104,6 +113,16 @@ class ProfileService:
                 alert="profile_api_unreachable",
             )
 
+            # Send alert to Google Chat
+            if AlertType is not None:
+                send_alert_safe(
+                    alert_type=AlertType.EXTERNAL_API_ERROR,
+                    level=AlertLevel.MEDIUM,
+                    message=f"Profile API error → using default profile for profile_id={profile_id}",
+                    context={"profile_id": profile_id, "error": str(exc), "error_type": type(exc).__name__},
+                    component="ProfileService",
+                )
+
             return UserProfile(
                 user_id=profile_id,
                 profile_id=profile_id,
@@ -128,6 +147,16 @@ class ProfileService:
                 error_message=str(exc),
                 alert="profile_api_unexpected",
             )
+
+            # Send alert to Google Chat
+            if AlertType is not None:
+                send_alert_safe(
+                    alert_type=AlertType.EXTERNAL_API_ERROR,
+                    level=AlertLevel.HIGH,
+                    message=f"Profile API failed → child=None for profile_id={profile_id}",
+                    context={"profile_id": profile_id, "error": str(exc), "error_type": type(exc).__name__},
+                    component="ProfileService",
+                )
 
             return UserProfile(
                 user_id=profile_id,

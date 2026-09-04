@@ -101,4 +101,10 @@ class Settings(BaseSettings):
     swagger_username: str = "admin"
     swagger_password: str = "pika-admin"
 
+    # Google Chat Alerting
+    # Webhook URL for sending alerts to Google Chat
+    google_chat_webhook_url: str = ""
+    # Enable/disable alerting (set to False to suppress all alerts)
+    alerting_enabled: bool = True
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

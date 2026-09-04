@@ -768,11 +768,8 @@ class LessonPipeline:
                 "request_id": request_id,
                 "status": "failed",
                 "data": {
-                    "rejected": True,
-                    "reason_code": exc.error_code,
-                    "reason": exc.message,
-                    "content": "",
-                    "lessons": [],
+                    "detail": {"code": exc.error_code, "message": exc.message},
+                    "suggested_lessons": [],
                     "metadata": {
                         "language": language,
                         "processing_time_ms": elapsed_ms,
@@ -794,11 +791,8 @@ class LessonPipeline:
                 "request_id": request_id,
                 "status": "failed",
                 "data": {
-                    "rejected": True,
-                    "reason_code": "internal_error",
-                    "reason": str(exc),
-                    "content": "",
-                    "lessons": [],
+                    "detail": {"code": "internal_error", "message": str(exc)},
+                    "suggested_lessons": [],
                     "metadata": {
                         "language": language,
                         "processing_time_ms": elapsed_ms,
@@ -919,11 +913,8 @@ class LessonPipeline:
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 language = (parent_config.language if parent_config and parent_config.language else None) or "vi"
                 data = {
-                    "rejected": True,
-                    "reason_code": "unsafe_content",
-                    "reason": guardrail_detail,
-                    "content": "",
-                    "lessons": [],
+                    "detail": {"code": "unsafe_content", "message": guardrail_detail},
+                    "suggested_lessons": [],
                     "metadata": {
                         "language": language,
                         "processing_time_ms": elapsed_ms,
@@ -976,12 +967,11 @@ class LessonPipeline:
             if extracted_result.get("rejected"):
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 language = (parent_config.language if parent_config and parent_config.language else None) or "vi"
+                reason_code = extracted_result.get("reason_code", "content_rejected")
+                reason_msg = extracted_result.get("reason", "Content was rejected")
                 data = {
-                    "rejected": True,
-                    "reason_code": extracted_result.get("reason_code", "content_rejected"),
-                    "reason": extracted_result.get("reason", "Content was rejected"),
-                    "content": extracted_result.get("content", ""),
-                    "lessons": [],
+                    "detail": {"code": reason_code, "message": reason_msg},
+                    "suggested_lessons": [],
                     "metadata": {
                         "language": language,
                         "processing_time_ms": elapsed_ms,
@@ -1013,16 +1003,13 @@ class LessonPipeline:
                     )
 
             if not extracted_result.get("lessons"):
-                # Model found no teachable content but did not reject - treat as rejection
+                # Model found no teachable content but did not reject - treat as empty result
                 logger.warning("vision_v3_empty_lessons", request_id=request_id)
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 language = (parent_config.language if parent_config and parent_config.language else None) or "vi"
                 data = {
-                    "rejected": True,
-                    "reason_code": "no_educational_content",
-                    "reason": "Không tìm thấy nội dung học tập rõ ràng trong ảnh",
-                    "content": "",
-                    "lessons": [],
+                    "detail": {"code": "no_educational_content", "message": "Không tìm thấy nội dung học tập rõ ràng trong ảnh"},
+                    "suggested_lessons": [],
                     "metadata": {
                         "language": language,
                         "processing_time_ms": elapsed_ms,

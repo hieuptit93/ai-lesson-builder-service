@@ -8,35 +8,36 @@ services:
     image: ai-lesson-builder:latest
     container_name: ai-lesson-builder
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:8000"
+    env_file:
+      - ../.env
     environment:
-      - AI_PROVIDER=${AI_PROVIDER:-openai}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}
+      # Override specific settings for production
       - DEBUG=false
-      - STREAM_TIMEOUT=60
+      - HOST=0.0.0.0
+      - PORT=8000
     restart: always
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     deploy:
       resources:
         limits:
-          cpus: '2'
-          memory: 2G
+          cpus: '4'
+          memory: 4G
         reservations:
-          cpus: '0.5'
-          memory: 512M
+          cpus: '1'
+          memory: 1G
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - ai-network
 
   # Optional: Nginx reverse proxy
   nginx:
@@ -53,3 +54,9 @@ services:
     restart: always
     profiles:
       - with-nginx
+    networks:
+      - ai-network
+
+networks:
+  ai-network:
+    driver: bridge

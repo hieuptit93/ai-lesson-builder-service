@@ -3,7 +3,6 @@ Send Alert Safe - Helper function to send alerts safely
 
 Mục đích:
     Helper function để gửi alerts một cách an toàn với:
-    - Auto-add [doancuong] prefix
     - Event loop handling
     - Error handling
     - Non-blocking send
@@ -49,7 +48,6 @@ def send_alert_safe(
     Args:
         alert_type: Type of alert
         level: Alert level
-        message: Alert message (will auto-add [doancuong] prefix if not present)
         context: Additional context
         component: Component name for logging
         request_id: Request ID for tracing
@@ -61,9 +59,8 @@ def send_alert_safe(
     try:
         alert_manager = get_alert_manager()
         
-        # Auto-add [doancuong] prefix if not present
-        if not message.startswith("[doancuong]"):
-            message = f"[doancuong] {message}"
+        if not message.startswith("Alert"):
+            message = f"Alert {message}"
         
         # Ensure context has component
         final_context = context.copy() if context else {}

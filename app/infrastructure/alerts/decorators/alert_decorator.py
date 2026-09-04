@@ -22,7 +22,7 @@ def alert_on_error(
     alert_type: AlertType,
     level: AlertLevel = AlertLevel.HIGH,
     timeout: Optional[float] = None,
-    message_prefix: str = "[doancuong]"
+    message_prefix: str = "Alert"
 ):
     """
     Decorator to send alert on function error or timeout

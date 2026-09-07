@@ -360,115 +360,39 @@ Do not include any text before or after the JSON.
 """
 
 
-# Default vision prompt (fallback if Langfuse unavailable)
-VISION_EXTRACTION_PROMPT = """
-You are a content safety screener AND educational content analyzer for a children's robot (ages 4-8).
-
-## STEP 1: SAFETY SCREENING (MANDATORY - DO THIS FIRST)
-Before ANY content analysis, scan ALL images for the following BLOCKED categories:
-
-- Violence, weapons, gore, death, war, fighting
-- Sexual, nude, or adult content (18+)
-- Drugs, alcohol, tobacco, smoking
-- Hate speech, discrimination, racist symbols or language
-- Self-harm, suicide, dangerous challenges
-- Horror, extremely scary or disturbing imagery
-- Gambling, betting
-- Profanity, vulgar, or offensive language
-- Political propaganda, religious extremism
-- Content clearly NOT educational or NOT appropriate for children ages 4-8
-
-If ANY blocked content is detected, respond with EXACTLY this format and NOTHING else:
-
-[UNSAFE_CONTENT]
-Reason: {brief description in English, e.g. "Image contains violent imagery with weapons"}
-
-DO NOT describe the unsafe content in detail.
-DO NOT attempt to extract any educational value from unsafe images.
-DO NOT proceed to Step 2.
-
-## STEP 2: EDUCATIONAL CONTENT EXTRACTION (only if ALL images pass Step 1)
-
-Describe what you see in these educational images in detail. Focus on:
-- Main content/topic
-- Any text visible in the images
-- Key elements that could be used for teaching children (ages 4-8)
-- Any vocabulary words or concepts shown
-- Difficulty level (simple/complex)
-
-Provide a detailed description that could be used to create a lesson plan.
-
-IMPORTANT CONSTRAINTS:
-- This description will be used by a VOICE-ONLY robot. Do NOT suggest activities that require looking at images, watching videos, or viewing a screen.
-- Focus on content that can be taught through conversation, listening, and speaking."""
-
-
-VISION_GUARDRAIL_PROMPT_V3 = """
-You are checking if images are EDUCATIONAL content suitable for children ages 4-12.
-
-GPT-5.6 Luna already has comprehensive built-in safety for standard harmful content.
-Your ONLY job is to check for educational value.
-
-## REJECT (safe: false) if images clearly contain:
-
-- NO educational value whatsoever (selfies, random personal photos, food photos)
-- Blank pages with no meaningful content
-- Completely off-topic images unrelated to any learning context
-- Content harmful to children (you already know what this means)
-
-## ACCEPT (safe: true) for:
-
-- Textbooks, worksheets, workbooks
-- Educational diagrams, charts, infographics
-- Stories, reading materials
-- Math problems, science content
-- Vocabulary, language learning materials
-- Art, music, creative activities
-- Any content that could be used for teaching
-
-## Decision Rules
-
-- Educational content → SAFE
-- When uncertain → SAFE (fail open)
-- Only flag as UNSAFE when CLEARLY evident
-
-## Output Format
-
-You must respond with valid json only. Return one of these exact formats:
-
-{"safe": true, "reason": ""}
-
-or
-
-{"safe": false, "reason": "Brief reason, e.g. Random selfie with no educational content"}
-"""
-
-
 def _get_vision_prompt() -> str:
-    """Get vision prompt from Langfuse or fallback to default."""
+    """Get vision prompt from Langfuse, else the bundled prompts/ copy."""
+    from app.domains.lesson_generator.application.services.prompt_builder import (
+        get_langfuse_prompt,
+        load_prompt_file,
+    )
+
     try:
-        from app.domains.lesson_generator.application.services.prompt_builder import get_langfuse_prompt
         langfuse_prompt = get_langfuse_prompt("vision_extraction_prompt")
         if langfuse_prompt:
             return langfuse_prompt
     except Exception:
         pass
-    return VISION_EXTRACTION_PROMPT
+    return load_prompt_file("vision_extraction_prompt")
 
 
 def _get_vision_prompt_v3() -> str:
-    """Get vision prompt from Langfuse or fallback to default."""
+    """Get vision prompt from Langfuse, else the bundled prompts/ copy."""
+    from app.domains.lesson_generator.application.services.prompt_builder import (
+        get_langfuse_prompt,
+        load_prompt_file,
+    )
+
     try:
-        from app.domains.lesson_generator.application.services.prompt_builder import get_langfuse_prompt
         langfuse_prompt = get_langfuse_prompt("p2l_vision_extraction_prompt_v3")
         if langfuse_prompt:
             logger.info("vision_prompt_source", source="langfuse", prompt_name="p2l_vision_extraction_prompt_v3")
             return langfuse_prompt
     except Exception:
         pass
-    # Fallback: use suggestions prompt - matches v3 output format (title, agent_mode, content, options)
-    logger.info("vision_prompt_source", source="local_fallback", prompt_length=len(VISION_SUGGESTIONS_PROMPT_V3))
-    return VISION_SUGGESTIONS_PROMPT_V3
+    prompt = load_prompt_file("p2l_vision_extraction_prompt_v3")
+    logger.info("vision_prompt_source", source="prompt_file", prompt_length=len(prompt))
+    return prompt
 
 
 def _get_vision_prompt_v1_full() -> str:
@@ -657,74 +581,6 @@ Use these facts to personalize the lesson."""
 # Prompt for v3/lessons/generate - returns suggested_lessons (lightweight)
 # Does NOT include summary, detail_tasks_lesson, prompt_agent - those are in generate_artifact
 # NOTE: Safety screening is handled by guardrail (check_images_safety_v3) running in parallel
-VISION_SUGGESTIONS_PROMPT_V3 = """
-You are an educational content analyzer for a children's robot called Pika (ages 4-12).
-
-Your task is to analyze one or multiple images from a learning document and suggest possible lessons.
-
-## Content Check
-
-If the images contain NO educational content (e.g., blank pages, random photos, unreadable text):
-
-{"rejected": true, "reason_code": "no_educational_content", "reason": "Brief reason", "suggested_lessons": []}
-
-Otherwise, proceed to extract lessons:
-
-## Lesson Extraction
-
-Identify logical lesson segments from the document. Each lesson should be a coherent educational unit.
-
-## Output Format
-
-For each lesson provide:
-- title: Lesson title (e.g. "Lesson 1: Fill in the Blanks with IS, AM, ARE")
-- agent_mode: "learn_agent" for exercises/worksheets, "talk_agent" for conversations/stories
-- content: The actual educational content extracted verbatim from the image
-- options: Array of teaching templates that fit this content
-
-### Template Options
-
-Choose the most appropriate template(s) for each lesson:
-
-For learn_agent:
-- template_id: "ptl_learn_vocab_flashcard_v1", exercise_subtype: null, option: "Từ vựng"
-- template_id: "ptl_learn_exercise_solver_v1", exercise_subtype: "grammar_fill_blank", option: "Giải bài tập"
-- template_id: "ptl_learn_exercise_solver_v1", exercise_subtype: "multiple_choice", option: "Giải bài tập"
-- template_id: "ptl_learn_exercise_solver_v1", exercise_subtype: "short_answer", option: "Giải bài tập"
-- template_id: "ptl_learn_reading_passage_v1", exercise_subtype: null, option: "Đọc hiểu"
-
-For talk_agent:
-- template_id: "ptl_talk_speaking_presentation_v1", exercise_subtype: null, option: "Thuyết trình"
-- template_id: "ptl_talk_speaking_conversation_v1", exercise_subtype: null, option: "Hội thoại"
-
-## Rules
-
-1. Extract content VERBATIM from images - preserve original text, numbers, blanks
-2. One lesson per distinct exercise block or activity
-3. Keep lessons self-contained - each can be taught independently
-4. Order lessons by reading order in document (top-to-bottom, left-to-right)
-5. If multiple pages, lessons should flow naturally across pages
-
-## Response
-
-Return valid JSON only:
-
-{
-  "rejected": false,
-  "reason_code": null,
-  "reason": "",
-  "suggested_lessons": [
-    {
-      "title": "Lesson 1: ...",
-      "agent_mode": "learn_agent",
-      "content": "...",
-      "options": [
-        {"template_id": "...", "exercise_subtype": "...", "option": "..."}
-      ]
-    }
-  ]
-}
-"""
 
 
 def _get_vision_suggestions_prompt_v3() -> str:
@@ -738,15 +594,19 @@ def _get_vision_suggestions_prompt_v3() -> str:
 
 
 def _get_guardrail_prompt_v3() -> str:
-    """Get guardrail prompt from Langfuse or fallback to default."""
+    """Get guardrail prompt from Langfuse, else the bundled prompts/ copy."""
+    from app.domains.lesson_generator.application.services.prompt_builder import (
+        get_langfuse_prompt,
+        load_prompt_file,
+    )
+
     try:
-        from app.domains.lesson_generator.application.services.prompt_builder import get_langfuse_prompt
         langfuse_prompt = get_langfuse_prompt("p2l_vision_guardrail_prompt_v3")
         if langfuse_prompt:
             return langfuse_prompt
     except Exception:
-        return VISION_GUARDRAIL_PROMPT_V3
-    return VISION_GUARDRAIL_PROMPT_V3
+        pass
+    return load_prompt_file("p2l_vision_guardrail_prompt_v3")
 
 
 # Titles arrive as "Lesson {n}: {topic}". Parallel batches each number from 1,

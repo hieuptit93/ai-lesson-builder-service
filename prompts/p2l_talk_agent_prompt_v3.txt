@@ -1,0 +1,48 @@
+Generate sections 3 through 5 of a system_task_description for Pika's talk_agent bot.
+
+CRITICAL LANGUAGE RULES:
+- If the LESSON INPUT or surrounding caller context provides a language mode, obey it for all user-visible generated fields, especially `detail_tasks_lesson`, `conversation_goal`, and `dialogue_agenda`.
+- Supported modes:
+  1. EN / English only: write all Pika-facing text in English. Do NOT output Vietnamese words like `Hoạt động`, `bé`, `Đúng rồi`, or `Cảm ơn`.
+  2. VI / Vietnamese only: write all Pika-facing text in Vietnamese. Keep quoted English lesson content unchanged.
+  3. VI-EN / Bilingual Vietnamese-English: each Pika turn/step is primarily Vietnamese; add the final sentence as an English translation or short English recap.
+  4. EN-VI / Bilingual English-Vietnamese: each Pika turn/step is primarily English; add the final sentence as a Vietnamese translation or short Vietnamese recap.
+- If no explicit language mode is visible in the prompt, infer from the lesson/profile context; if still unknown, use English for English-learning content.
+- Never hardcode Vietnamese-only output unless the language mode is VI.
+
+## LESSON INPUT:
+  • Content: {lesson_content}
+  • Template ID: {template_id}
+{child_info}
+## INSTRUCTIONS:
+Generate sections 3–5 based on the lesson input, following these EXACT rules:
+
+**multi_turn_flow** — Always use these EXACT 3 generic rules verbatim (do NOT derive from lesson content):
+  - "Use past turns well, stay on topic, support then gently steer back."
+  - "Ask one question at a time. No why questions."
+  - "If irrelevant/no response, ask again playfully max 2 times."
+
+**conversation_goal** — Write 1–2 sentences describing what the child will accomplish. Then paste the FULL lesson content VERBATIM from the input on the next line, with no edits or summarization.
+
+**dialogue_agenda** — Numbered steps with explicit max turn counts. Choose the pattern based on template_id:
+
+  For ptl_talk_speaking_presentation_v1:
+    - "Step 1 — Read example (1 turn): Read the example description aloud to the child. Ask one simple question about it."
+    - "Step 2 — Build (max 6 turns, one template per turn): Guide the child through each sentence template one at a time. Move to Step 3 after all templates are completed."
+    - "Step 3 — Q&A (max 5 turns, one question per turn): Ask each follow-up question in order. Move to Step 4 after all questions are done."
+    - "Step 4 — Present (max 3 turns): Ask the child to say all their sentences together as a full presentation."
+
+  For ptl_talk_roleplay_v1:
+    - "Step 1 — Read example dialogue (1 turn): Read the example dialogue aloud to the child. Ask one quick question about it."
+    - "Step 2 — Make own dialogue (max 5 turns, one prompt per turn): Guide the child through each sentence prompt one at a time."
+    - "Step 3 — Full run (max 2 turns): Ask the child to say their completed dialogue from start to finish."
+
+**detail_tasks_lesson** — exactly 3 specific activities describing what Pika will do with the child. The language MUST follow the CRITICAL LANGUAGE RULES above, not always Vietnamese.
+
+Respond ONLY with valid JSON matching this exact schema, no preamble:
+{
+  "multi_turn_flow": ["<bullet>", "..."],
+  "conversation_goal": "<1-2 sentence goal>\n\n<full lesson content verbatim>",
+  "dialogue_agenda": ["<step 1>", "..."],
+  "detail_tasks_lesson": "<Activity 1 label in the required language>: <activity 1>\n<Activity 2 label in the required language>: <activity 2>\n<Activity 3 label in the required language>: <activity 3>"
+}

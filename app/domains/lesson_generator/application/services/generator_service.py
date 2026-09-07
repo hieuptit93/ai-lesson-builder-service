@@ -90,6 +90,74 @@ def _extract_expert_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
+# Header markup ("**") and fence backticks bleed into section edges because
+# _EXPERT_PATTERN stops at the ":" before the closing "**".
+_SECTION_TRIM = " \t\r\n*`"
+_JSON_FENCE = "```json"
+
+
+class _ExpertSectionScanner:
+    """Incrementally extracts expert discussion sections from streamed text.
+
+    The generation prompt emits `**[A] Name:** <prose>` blocks in order
+    [A]..[E] before the JSON payload. A section is emitted as soon as the next
+    header - or the start of the JSON block - proves it complete.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._expert: str | None = None
+        self._content_start = 0
+        self._search_pos = 0
+        self._closed = False
+
+    def feed(self, delta: str) -> list[tuple[str, str]]:
+        if self._closed:
+            return []
+
+        self._buf += delta
+        sections: list[tuple[str, str]] = []
+
+        while (m := _EXPERT_PATTERN.search(self._buf, self._search_pos)) is not None:
+            if self._expert is not None:
+                content = self._buf[self._content_start : m.start()].strip(_SECTION_TRIM)
+                if content:
+                    sections.append((self._expert, content))
+            self._expert = _EXPERT_MAP.get(m.group(1), m.group(1).lower())
+            self._content_start = m.end()
+            self._search_pos = m.end()
+
+        json_start = self._find_json_start()
+        if json_start != -1:
+            if self._expert is not None:
+                content = self._buf[self._content_start : json_start].strip(_SECTION_TRIM)
+                if content:
+                    sections.append((self._expert, content))
+            self._closed = True
+
+        return sections
+
+    def flush(self) -> list[tuple[str, str]]:
+        """Emit the trailing section when the stream ended without a JSON block."""
+        if self._closed or self._expert is None:
+            return []
+
+        self._closed = True
+        content = self._buf[self._content_start :].strip(_SECTION_TRIM)
+        return [(self._expert, content)] if content else []
+
+    def _find_json_start(self) -> int:
+        positions = [
+            pos
+            for pos in (
+                self._buf.find(_JSON_FENCE, self._content_start),
+                self._buf.find("{", self._content_start),
+            )
+            if pos != -1
+        ]
+        return min(positions) if positions else -1
+
+
 def _extract_user_message(prompt: str) -> str:
     """Extract user message from prompt for logging."""
     if len(prompt) > 200:
@@ -188,9 +256,11 @@ class GeneratorService:
     ) -> AsyncGenerator[tuple[str, object], None]:
         """Streaming version of generate_lesson for the v1 SSE flow.
 
-        Yields ("lesson", lesson_dict) the moment each lesson object completes
-        in the streamed JSON, then ("complete", (lesson_plan, usage)) with the
-        authoritative full parse. Same prompt/model/quality as generate_lesson.
+        Yields ("thinking:{expert_key}", prose) as each expert section of the
+        discussion completes, ("lesson", lesson_dict) the moment each lesson
+        object completes in the streamed JSON, then ("complete", (lesson_plan,
+        usage)) with the authoritative full parse. Same prompt/model/quality as
+        generate_lesson.
         """
         from app.domains.vision_extract.infrastructure.openai_vision_adapter import _LessonStreamScanner
 
@@ -219,6 +289,7 @@ class GeneratorService:
         )
 
         scanner = _LessonStreamScanner()
+        expert_scanner = _ExpertSectionScanner()
         full_text = ""
         usage: dict = {}
 
@@ -237,8 +308,13 @@ class GeneratorService:
                 usage = final_usage
                 continue
             full_text += chunk
+            for expert_key, content in expert_scanner.feed(chunk):
+                yield f"thinking:{expert_key}", content
             for lesson in scanner.feed(chunk):
                 yield "lesson", lesson
+
+        for expert_key, content in expert_scanner.flush():
+            yield f"thinking:{expert_key}", content
 
         lesson_plan = _extract_json_from_text(full_text)
 

@@ -22,6 +22,7 @@ services:
     ports:
       - "3010:3000"
     environment: &langfuse-env
+      HOSTNAME: "0.0.0.0"
       NEXTAUTH_URL: http://localhost:3010
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/postgres
@@ -52,7 +53,7 @@ services:
       - .env
     extra_hosts: []
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/public/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/public/health"]
       interval: 10s
       timeout: 5s
       retries: 12

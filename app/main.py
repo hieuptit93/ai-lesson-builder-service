@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv(override=False)  # Load .env but don't override OS env vars (OS > .env > default)
+
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 

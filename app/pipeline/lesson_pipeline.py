@@ -18,9 +18,9 @@ from app.core.config import Settings
 from app.core.enums import AgentBotId
 from app.domains.lesson_generator.application.services.generator_service import GeneratorService
 from app.domains.lesson_generator.application.services.prompt_builder import (
-    CONTEXT_STYLE_GUIDELINE_PROMPT_TEMPLATE,
     USER_PROFILE_PROMPT_TEMPLATE,
     get_langfuse_prompt,
+    load_prompt_file,
     _get_language_prompt,
     _get_task_base_on_language_prompt,
 )
@@ -93,11 +93,13 @@ def _transform_lesson_plan(
     if "lessons" not in lesson_plan:
         return lesson_plan
 
-    # Try to fetch prompts from Langfuse, fallback to local constants
-    context_style = get_langfuse_prompt("context_style_guideline_prompt")
-    if context_style is None:
-        context_style = CONTEXT_STYLE_GUIDELINE_PROMPT_TEMPLATE
+    # Try to fetch prompts from Langfuse, fallback to the bundled prompts/ copy
+    context_style = get_langfuse_prompt("context_style_guideline_prompt") or load_prompt_file(
+        "context_style_guideline_prompt"
+    )
 
+    # user_profile_prompt has no bundled copy on purpose: it is a tiny format
+    # string owned by the code, not prose worth managing in Langfuse.
     user_profile_template = get_langfuse_prompt("user_profile_prompt")
     if user_profile_template is None:
         user_profile_template = USER_PROFILE_PROMPT_TEMPLATE
@@ -1036,6 +1038,7 @@ class LessonPipeline:
             # carries the authoritative fully-transformed lessons.
             extracted_result: dict = {}
             token_usage: dict = {}
+            expert_log_parts: list[str] = []
             lesson_index = 0
             event = await first_event_task
             while True:
@@ -1051,6 +1054,21 @@ class LessonPipeline:
                         "lesson": preview,
                         "image_url": pipeline_image,
                     }, "lesson")
+                elif event_type.startswith("thinking:"):
+                    expert_key = event_type.split(":", 1)[1]
+                    expert_log_parts.append(payload)
+                    # final_editor only emits JSON, so its event is synthesized
+                    # after the lessons are known (see below).
+                    if expert_key != "final_editor":
+                        avatar_attr = self.EXPERT_AVATARS.get(expert_key, "")
+                        avatar_url = getattr(self._settings, avatar_attr, "") if self._settings else ""
+                        yield _sse({
+                            "phase": "thinking",
+                            "expert": expert_key,
+                            "expert_name": expert_key.replace("_", " ").title(),
+                            "content": payload,
+                            "avatar_url": avatar_url,
+                        }, "thinking")
                 elif event_type == "complete":
                     extracted_result, token_usage = payload
                     break
@@ -1223,7 +1241,7 @@ class LessonPipeline:
                 "is_mock_data": is_mock_data,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "model_used": vision_model,
-                "expert_discussion_log": "",
+                "expert_discussion_log": "\n".join(expert_log_parts),
                 "vision_extracted_text": vision_extracted_text,
                 "usage": token_usage,
                 "cost_usd": _cost_from_usage(vision_model, token_usage),
@@ -1253,6 +1271,18 @@ class LessonPipeline:
                     "suggested_lessons": lessons_data,
                     "metadata": metadata,
                 }
+
+            if use_full_prompt:
+                avatar_attr = self.EXPERT_AVATARS.get("final_editor", "")
+                avatar_url = getattr(self._settings, avatar_attr, "") if self._settings else ""
+                yield _sse({
+                    "phase": "thinking",
+                    "expert": "final_editor",
+                    "expert_name": "Final Editor",
+                    "content": data["content"],
+                    "metadata": {"lesson_count": len(lessons_data)},
+                    "avatar_url": avatar_url,
+                }, "thinking")
 
             yield _sse({"phase": "complete", "data": data, "image_url": pipeline_image}, "pipeline")
             yield "data: [DONE]\n\n"

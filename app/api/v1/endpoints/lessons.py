@@ -48,7 +48,6 @@ async def generate_lesson(
 
     if body.stream:
         # Streaming mode - 1 call optimization (~10s) with D-steps, mem0 included
-        # Note: expert_discussion_log will be empty (trade-off for speed)
         return StreamingResponse(
             pipeline.stream_generate_v3(body, request_id=request_id, delay=settings.stream_delay_seconds, use_full_prompt=True),
             media_type="text/event-stream",

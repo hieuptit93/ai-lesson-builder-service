@@ -1,5 +1,7 @@
 """Builds the multi-persona lesson generation prompt."""
 
+import time
+
 import structlog
 
 from app.domains.lesson_generator.infrastructure.templates.lesson_templates import ActivityTemplate, get_template
@@ -122,16 +124,55 @@ def get_langfuse_client():
         return None
 
 
+# Prompts change rarely, and the SDK fetch is a SYNCHRONOUS call made from
+# inside the async request path - a slow Langfuse therefore stalls the event
+# loop, not just one request. Guard rails:
+#   - serve from an in-process cache for TTL seconds (no network on the hot path)
+#   - short timeout, no retries: a bad fetch costs ~2s, not 30s
+#   - on failure keep serving the last good value (stale-while-error) and don't
+#     re-attempt for COOLDOWN seconds, so an outage can't stall every request
+_PROMPT_CACHE_TTL_SECONDS = 300
+_PROMPT_FETCH_TIMEOUT_SECONDS = 2
+_PROMPT_FAILURE_COOLDOWN_SECONDS = 60
+
+# key -> (content | None, fetched_at, is_failure). A failure entry expires after
+# the shorter cooldown so Langfuse gets retried once it recovers.
+_prompt_cache: dict[str, tuple[str | None, float, bool]] = {}
+# key -> last content Langfuse ever returned; survives failure entries so an
+# outage can be served from it instead of falling back to the local template.
+_prompt_last_good: dict[str, str] = {}
+
+
+def _prompt_cache_get(key: str) -> tuple[bool, str | None]:
+    """Return (is_fresh, content) for a cached entry."""
+    entry = _prompt_cache.get(key)
+    if entry is None:
+        return False, None
+    content, fetched_at, is_failure = entry
+    ttl = _PROMPT_FAILURE_COOLDOWN_SECONDS if is_failure else _PROMPT_CACHE_TTL_SECONDS
+    if (time.monotonic() - fetched_at) >= ttl:
+        return False, None
+    # A failure entry still serves the last good copy when we have one.
+    if is_failure and content is None:
+        return True, _prompt_last_good.get(key)
+    return True, content
+
+
 def get_langfuse_prompt(prompt_name: str, version: int | None = None) -> str | None:
-    """Fetch a prompt from Langfuse by name.
+    """Fetch a prompt from Langfuse by name, cached in-process.
 
     Args:
         version: Pin to a specific prompt version; None follows the
                  production label (latest promoted version).
 
     Returns:
-        Prompt content if found, None if not available or error.
+        Prompt content, or None to let the caller use its local template.
     """
+    cache_key = f"{prompt_name}@{version or 'production'}"
+    is_fresh, cached = _prompt_cache_get(cache_key)
+    if is_fresh:
+        return cached
+
     try:
         langfuse = get_langfuse_client()
         if langfuse is None:
@@ -143,12 +184,21 @@ def get_langfuse_prompt(prompt_name: str, version: int | None = None) -> str | N
                 prompt_name=prompt_name,
                 reason="client_unavailable",
             )
+            _prompt_cache[cache_key] = (None, time.monotonic(), True)
             return None
 
+        # Keep the SDK's own cache aligned with ours, and fail fast: this call
+        # blocks the event loop, so a long timeout/retries would turn a Langfuse
+        # hiccup into multi-minute request latency.
+        fetch_kwargs = {
+            "cache_ttl_seconds": _PROMPT_CACHE_TTL_SECONDS,
+            "fetch_timeout_seconds": _PROMPT_FETCH_TIMEOUT_SECONDS,
+            "max_retries": 0,
+        }
         if version:
-            prompt = langfuse.get_prompt(name=prompt_name, version=version)
+            prompt = langfuse.get_prompt(name=prompt_name, version=version, **fetch_kwargs)
         else:
-            prompt = langfuse.get_prompt(name=prompt_name)
+            prompt = langfuse.get_prompt(name=prompt_name, **fetch_kwargs)
         if prompt:
             content = prompt.prompt if hasattr(prompt, 'prompt') else None
             if content:
@@ -169,6 +219,9 @@ def get_langfuse_prompt(prompt_name: str, version: int | None = None) -> str | N
                     target_service="langfuse",
                     prompt_name=prompt_name,
                 )
+            _prompt_cache[cache_key] = (content, time.monotonic(), content is None)
+            if content:
+                _prompt_last_good[cache_key] = content
             return content
         logger.warning(
             "langfuse.prompt.not_found",
@@ -179,8 +232,13 @@ def get_langfuse_prompt(prompt_name: str, version: int | None = None) -> str | N
             source="local",
             reason="prompt_not_found",
         )
+        _prompt_cache[cache_key] = (None, time.monotonic(), True)
         return None
     except Exception as e:
+        # Serve the last good copy through the outage rather than silently
+        # downgrading to the local template mid-flight. The failure entry keeps
+        # further requests off the network for the cooldown window.
+        stale = _prompt_last_good.get(cache_key)
         logger.error(
             "langfuse.prompt.error",
             log_type="external_api",
@@ -188,8 +246,11 @@ def get_langfuse_prompt(prompt_name: str, version: int | None = None) -> str | N
             target_service="langfuse",
             prompt_name=prompt_name,
             error=str(e),
+            served="stale_cache" if stale else "local_template",
+            cooldown_seconds=_PROMPT_FAILURE_COOLDOWN_SECONDS,
         )
-        return None
+        _prompt_cache[cache_key] = (None, time.monotonic(), True)
+        return stale
 
 
 _LESSON_PROMPT_SOURCE_CACHE: list = []  # cache: [] = unread, [value] = cached
@@ -950,6 +1011,100 @@ Output ONLY valid JSON - EXACTLY 1 lesson:
 """
 
 
+# Appended to the user message in regenerate mode. The system message is the
+# SAME production rules `generate` uses, so both endpoints share one cached
+# prefix; this block is what turns "produce 3 lessons" into "replace this one".
+_REGENERATE_OVERRIDE_TEMPLATE = """
+
+---
+
+## REGENERATE MODE — OVERRIDES THE LESSON COUNT AND OUTPUT SHAPE ABOVE
+
+You are REPLACING one lesson the parent was not happy with. Every pedagogical
+rule above still applies in full (engagement, Pika voice-only, prompt_agent
+D-step format, cross-field consistency, safety). Only the lesson count and the
+JSON shape change.
+
+### LESSON BEING REPLACED
+- Title: {ORIGINAL_TITLE}
+- Summary: {ORIGINAL_SUMMARY}
+- Detail Tasks: {ORIGINAL_DETAIL_TASKS}
+- Prompt Agent: {ORIGINAL_PROMPT_AGENT}
+
+### RULES
+1. Output EXACTLY 1 lesson. NOT 2, NOT 3. ONLY 1.
+2. `lesson_id` MUST be exactly "lesson_regen".
+3. Keep the SAME topic and the SAME source material as the lesson above, but
+   use DIFFERENT activities - do not repeat its tasks, examples, or wording.
+4. The 5-expert discussion [A] -> [E] still applies; [E] returns the JSON.
+
+### OUTPUT (replaces the 3-lesson schema above)
+```json
+{{
+  "rejected": false,
+  "reason_code": null,
+  "reason": "",
+  "content": "Regenerated lesson successfully",
+  "lessons": [
+    {{
+      "lesson_id": "lesson_regen",
+      "title": "...",
+      "summary": "...",
+      "detail_tasks_lesson": "Hoạt động 1: ...\\nHoạt động 2: ...\\nHoạt động 3: ...",
+      "prompt_agent": "D1: ...\\nD2: ...\\n→ GOAL: ..."
+    }}
+  ]
+}}
+```
+"""
+
+
+def build_regenerate_lesson_prompt_split(
+    *,
+    original_lesson,
+    extracted_content: dict,
+    subject: str,
+    purpose: str,
+    language: str,
+    memory_facts: list | None = None,
+    parent_notes: str | None = None,
+    child_age: int | None = None,
+    child_name: str | None = None,
+) -> tuple[str | None, str]:
+    """Build (system_prompt, user_prompt) for regenerate using the PRODUCTION rules.
+
+    Regenerate used to run on a 1.2KB local template that carried none of the
+    engagement / Pika-voice / D-step / consistency rules, so replacement lessons
+    came out visibly weaker than the originals. This reuses the exact system
+    message `build_lesson_prompt_split` produces - same rules, and the same
+    cached prefix, so regenerate rides the cache `generate` already warmed.
+
+    Returns:
+        (system_prompt, user_prompt). system_prompt is None when the production
+        template cannot be split - caller should fall back to the legacy prompt.
+    """
+    system_prompt, user_prompt = build_lesson_prompt_split(
+        extracted_content=extracted_content,
+        subject=subject,
+        purpose=purpose,
+        language=language,
+        memory_facts=memory_facts,
+        parent_notes=parent_notes,
+        child_age=child_age,
+        child_name=child_name,
+    )
+    if system_prompt is None:
+        return None, user_prompt
+
+    override = _REGENERATE_OVERRIDE_TEMPLATE.format(
+        ORIGINAL_TITLE=getattr(original_lesson, "title", ""),
+        ORIGINAL_SUMMARY=getattr(original_lesson, "summary", ""),
+        ORIGINAL_DETAIL_TASKS=getattr(original_lesson, "detail_tasks_lesson", ""),
+        ORIGINAL_PROMPT_AGENT=getattr(original_lesson, "prompt_agent", ""),
+    )
+    return system_prompt, user_prompt + override
+
+
 def build_regenerate_lesson_prompt(
     *,
     original_lesson,
@@ -962,7 +1117,7 @@ def build_regenerate_lesson_prompt(
     child_age: int | None = None,
     child_name: str | None = None,
 ) -> str:
-    """Build prompt for regenerate - uses dedicated template, NOT shared with generate."""
+    """Legacy single-message regenerate prompt (fallback when the split fails)."""
     template_list = get_template(subject)
     template_text = _format_template(template_list)
 

@@ -14,6 +14,7 @@ from app.domains.lesson_generator.application.services.prompt_builder import (
     build_lesson_prompt,
     build_lesson_prompt_split,
     build_regenerate_lesson_prompt,
+    build_regenerate_lesson_prompt_split,
     build_talk_agent_section_2,
     build_talk_agent_sections_3_to_5_from_json,
     build_talk_agent_sections_6_to_8,
@@ -275,7 +276,9 @@ class GeneratorService:
     ) -> tuple[str, dict]:
         start = time.monotonic()
 
-        prompt = build_regenerate_lesson_prompt(
+        # Same production rules (and same cached prefix) as generate_lesson,
+        # plus a REGENERATE MODE override that asks for exactly 1 lesson.
+        system_prompt, user_prompt = build_regenerate_lesson_prompt_split(
             original_lesson=original_lesson,
             extracted_content=extracted_content,
             subject=subject,
@@ -296,10 +299,26 @@ class GeneratorService:
             target_endpoint="https://api.openai.com/v1/chat/completions",
             http_method="POST",
             model=self._model_name,
-            input_content=_extract_user_message(prompt),
+            mode="regenerate_production_prompt" if system_prompt else "regenerate_legacy",
+            input_content=_extract_user_message(user_prompt),
         )
 
-        raw_response, usage = await self._adapter.generate(prompt)
+        if system_prompt:
+            raw_response, usage = await self._adapter.generate_split(system_prompt, user_prompt)
+        else:
+            # Production template unsplittable - fall back to the legacy prompt
+            legacy_prompt = build_regenerate_lesson_prompt(
+                original_lesson=original_lesson,
+                extracted_content=extracted_content,
+                subject=subject,
+                purpose=purpose,
+                language=language,
+                memory_facts=memory_facts,
+                parent_notes=parent_notes,
+                child_age=child_age,
+                child_name=child_name,
+            )
+            raw_response, usage = await self._adapter.generate(legacy_prompt)
         expert_sections = _extract_expert_sections(raw_response)
         expert_log = "\n".join(content for _, content in expert_sections)
         lesson_plan = _extract_json_from_text(raw_response)
@@ -653,7 +672,8 @@ class GeneratorService:
         child_name: str | None = None,
     ) -> AsyncGenerator[tuple[str, str], None]:
         """Yields (event_type, content) tuples for regeneration."""
-        prompt = build_regenerate_lesson_prompt(
+        # Same production rules (and cached prefix) as the sync path.
+        system_prompt, user_prompt = build_regenerate_lesson_prompt_split(
             original_lesson=original_lesson,
             extracted_content=extracted_content,
             subject=subject,
@@ -664,6 +684,18 @@ class GeneratorService:
             child_age=child_age,
             child_name=child_name,
         )
+        if system_prompt is None:
+            user_prompt = build_regenerate_lesson_prompt(
+                original_lesson=original_lesson,
+                extracted_content=extracted_content,
+                subject=subject,
+                purpose=purpose,
+                language=language,
+                memory_facts=memory_facts,
+                parent_notes=parent_notes,
+                child_age=child_age,
+                child_name=child_name,
+            )
 
         # Log LLM request start
         logger.info(
@@ -674,7 +706,8 @@ class GeneratorService:
             target_endpoint="https://api.openai.com/v1/chat/completions",
             http_method="POST",
             model=self._model_name,
-            input_content=_extract_user_message(prompt),
+            mode="regenerate_production_prompt" if system_prompt else "regenerate_legacy",
+            input_content=_extract_user_message(user_prompt),
         )
 
         buffer = ""
@@ -683,7 +716,12 @@ class GeneratorService:
         json_accumulator = ""
         in_json_block = False
 
-        async for chunk, usage in self._adapter.stream_generate(prompt):
+        stream = (
+            self._adapter.stream_generate_split(system_prompt, user_prompt)
+            if system_prompt
+            else self._adapter.stream_generate(user_prompt)
+        )
+        async for chunk, _usage in stream:
             buffer += chunk
 
             if in_json_block:

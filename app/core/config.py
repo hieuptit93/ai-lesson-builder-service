@@ -32,11 +32,13 @@ class Settings(BaseSettings):
     # GPT-5.6 Terra: $2/1M input, 128K output, Feb 2026 knowledge
     # Using Structured Outputs with strict schema - decoder enforced compliance
     openai_vision_model: str = "gpt-5.6-terra"
-    # V1 extract_from_images only: plain describe/OCR feeding the strong
-    # GPT-4.1 generation step. Terra measured ~67 output tok/s vs GPT-4.1
-    # ~170 tok/s - for a ~700 token description that's 10s vs ~4s, and the
-    # downstream 5-expert prompt does the heavy pedagogy anyway.
-    openai_v1_extraction_model: str = "gpt-4.1"
+    # V1 extract_from_images: Terra for extraction QUALITY. A/B (04/09): text
+    # accuracy equal to gpt-4.1 on clean images, but Terra fills the structured
+    # fields the generation prompt's scope rules consume (unreadable_text,
+    # confidence, page_side, section_id) - safer on blurry/handwritten photos.
+    # Cost: +2-4s latency vs gpt-4.1 (~67 vs ~170 output tok/s). Switch back
+    # to "gpt-4.1" if speed matters more than robustness.
+    openai_v1_extraction_model: str = "gpt-5.6-terra"
     # GPT-5.6 Luna: $0.20/1M input - ultra cheap for guardrail
     openai_guardrail_model: str = "gpt-5.6-luna"
     # Enable guardrail for custom "educational value" check

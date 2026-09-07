@@ -341,13 +341,23 @@ class OpenAIVisionAdapter:
         return self._http
 
     async def _download_raw(self, url: str) -> bytes | None:
-        try:
-            response = await self._get_http().get(url)
-            response.raise_for_status()
-            return response.content
-        except Exception as e:  # noqa: BLE001
-            logger.warning("image_download_failed", url=url, error=str(e))
-            return None
+        """Fetch image bytes, retrying once on a transient network failure."""
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = await self._get_http().get(url, follow_redirects=True)
+                response.raise_for_status()
+                return response.content
+            except httpx.HTTPStatusError as e:
+                # A 4xx is the CDN's answer, not a blip - don't retry.
+                logger.warning("image_download_failed", url=url, error=str(e))
+                return None
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+        logger.warning("image_download_failed", url=url, error=str(last_error))
+        return None
 
     def _evict_if_full(self) -> None:
         if len(self._download_tasks) > _CACHE_MAX_ENTRIES:
@@ -373,6 +383,12 @@ class OpenAIVisionAdapter:
         raw = await task
 
         if raw is None:
+            # Drop the failed task so the next request retries instead of
+            # replaying the failure - a single CDN blip used to poison this
+            # URL until the cache filled up, sending every later request down
+            # the URL fallback (which OpenAI then times out on too).
+            if self._download_tasks.get(url) is task:
+                del self._download_tasks[url]
             return url  # fallback: let OpenAI fetch the URL itself
 
         max_dim = _VISION_MAX_DIM if variant == "full" else _GUARDRAIL_MAX_DIM

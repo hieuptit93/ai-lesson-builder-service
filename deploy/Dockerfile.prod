@@ -57,6 +57,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Production environment
+# ENVIRONMENT is baked into the image so it holds under any compose file or
+# orchestrator: app/__init__.py reads it to keep injected env vars winning over
+# a .env file, and logging/metrics tag traces with it.
+ENV ENVIRONMENT=production
 ENV DEBUG=false
 ENV HOST=0.0.0.0
 ENV PORT=8000

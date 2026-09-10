@@ -159,6 +159,18 @@ class _ExpertSectionScanner:
         return min(positions) if positions else -1
 
 
+def _log_inline_answer_violations(lesson_plan: dict) -> None:
+    """Detect-and-log only (no extra LLM call): item D-lines that speak the answer."""
+    violations = find_inline_answer_dlines(lesson_plan)
+    if violations:
+        logger.warning(
+            "lesson_generation.inline_answer_detected",
+            feature="LESSON",
+            violation_count=len(violations),
+            violations=violations[:10],
+        )
+
+
 def _extract_user_message(prompt: str) -> str:
     """Extract user message from prompt for logging."""
     if len(prompt) > 200:
@@ -220,11 +232,7 @@ class GeneratorService:
         expert_log = "\n".join(content for _, content in expert_sections)
         lesson_plan = _extract_json_from_text(raw_response)
 
-        violations = find_inline_answer_dlines(lesson_plan)
-        if violations:
-            lesson_plan, _ = await self._regenerate_with_hidden_answer_keys(
-                system_prompt, user_prompt, lesson_plan, violations
-            )
+        _log_inline_answer_violations(lesson_plan)
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
 
@@ -247,60 +255,6 @@ class GeneratorService:
         )
 
         return expert_log, lesson_plan
-
-    async def _regenerate_with_hidden_answer_keys(
-        self,
-        system_prompt: str | None,
-        user_prompt: str,
-        lesson_plan: dict,
-        violations: list[dict],
-    ) -> tuple[dict, dict]:
-        """One corrective pass when an item D-line speaks the answer.
-
-        The v1 runtime reads prompt_agent D-lines aloud in order, so
-        "Từ _oy là gì? Đáp án: boy" is an answer leak the child hears before
-        trying. Rule 13b wants "<hỏi> Gợi ý 1: … Gợi ý 2: … [Đáp án — …]";
-        compliance is unreliable in bilingual mode, so violations are sent
-        back once with the offending lines. Keeps whichever plan violates less.
-        """
-        logger.warning(
-            "lesson_generation.inline_answer_detected",
-            feature="LESSON",
-            violation_count=len(violations),
-            violations=violations[:10],
-        )
-        offending = "\n".join(f"- {v['lesson_id']} {v['dline']}: {v['problem']}" for v in violations)
-        correction = (
-            f"{user_prompt}\n\n## FORMAT VIOLATION — REGENERATE THE WHOLE RESPONSE\n"
-            "Your previous output broke rule 13b (HIDDEN KEY FORMAT CHECK) in these D-lines:\n"
-            f"{offending}\n"
-            "Rewrite EVERY item D-line exactly as: <câu hỏi cho bé> Gợi ý 1: <nghĩa/đặc điểm> "
-            "Gợi ý 2: <đặc điểm thứ hai hoặc số chữ cái> [Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau "
-            "khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: <chữ> → <từ>]. Never write the answer "
-            "right after the question, never '(b)' or 'Đáp án: boy' outside the bracket, and never "
-            "put the answer letter or word inside a hint. Keep everything else unchanged and return "
-            "the full response again (expert sections + JSON)."
-        )
-        if system_prompt:
-            raw_retry, retry_usage = await self._adapter.generate_split(system_prompt, correction)
-        else:
-            raw_retry, retry_usage = await self._adapter.generate(correction)
-        try:
-            retry_plan = _extract_json_from_text(raw_retry)
-        except (ValueError, json.JSONDecodeError) as e:
-            logger.warning("lesson_generation.hidden_key_retry_parse_error", error=str(e))
-            return lesson_plan, retry_usage
-        retry_violations = find_inline_answer_dlines(retry_plan)
-        logger.info(
-            "lesson_generation.hidden_key_retry_result",
-            feature="LESSON",
-            violations_before=len(violations),
-            violations_after=len(retry_violations),
-            kept="retry" if len(retry_violations) < len(violations) else "original",
-        )
-        if len(retry_violations) < len(violations):
-            return retry_plan, retry_usage
-        return lesson_plan, retry_usage
 
     @observe(name="lesson_generation_stream", capture_input=False, capture_output=False)
     async def stream_generate_lesson_v2(
@@ -379,17 +333,7 @@ class GeneratorService:
 
         lesson_plan = _extract_json_from_text(full_text)
 
-        # "lesson" events above are previews; the "complete" payload is the
-        # authoritative one, so a corrective pass here still reaches the client.
-        violations = find_inline_answer_dlines(lesson_plan)
-        if violations:
-            lesson_plan, retry_usage = await self._regenerate_with_hidden_answer_keys(
-                system_prompt, user_prompt, lesson_plan, violations
-            )
-            usage = {
-                key: (usage.get(key, 0) or 0) + (retry_usage.get(key, 0) or 0)
-                for key in set(usage) | set(retry_usage)
-            }
+        _log_inline_answer_violations(lesson_plan)
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
         logger.info(
@@ -577,75 +521,20 @@ class GeneratorService:
             )
             raise
 
+        # Detect-and-log only: a corrective regeneration doubled latency, so
+        # answer leaks are fixed in the prompts and surfaced here for tuning.
         leaks = find_checkpoint_answer_leaks(artifact.get("checkpoint_specs") or [])
         if leaks:
-            artifact, usage = await self._regenerate_without_leaks(
-                prompt, artifact, usage, leaks, lesson_title=lesson_title, template_id=template_id
+            logger.warning(
+                "learn_agent.answer_leak_detected",
+                feature="ARTIFACT",
+                lesson_title=lesson_title,
+                template_id=template_id,
+                leak_count=len(leaks),
+                leaks=leaks[:10],
             )
 
         return artifact, usage
-
-    async def _regenerate_without_leaks(
-        self,
-        prompt: str,
-        artifact: dict,
-        usage: dict,
-        leaks: list[dict],
-        *,
-        lesson_title: str,
-        template_id: str | None,
-    ) -> tuple[dict, dict]:
-        """One corrective pass when a checkpoint speaks the answer before the reveal.
-
-        English/bilingual output leaks most often ("This is a door. Try again!"),
-        and the leak is invisible to the runtime, so it is cheaper to spend one
-        extra call here than to ship it. Keeps whichever result leaks less.
-        """
-        logger.warning(
-            "learn_agent.answer_leak_detected",
-            feature="ARTIFACT",
-            lesson_title=lesson_title,
-            template_id=template_id,
-            leak_count=len(leaks),
-            leaks=leaks[:10],
-        )
-        offending = "\n".join(
-            f"- checkpoint \"{leak['checkpoint']}\": the {leak['field']} says \"{leak['word']}\", "
-            f"which is the answer of that checkpoint"
-            for leak in leaks
-        )
-        retry_prompt = (
-            f"{prompt}\n\n## ANSWER LEAK DETECTED — REGENERATE THE WHOLE JSON\n"
-            f"Your previous output spoke the answer before the reveal case:\n{offending}\n"
-            "Rewrite those checkpoints so the target word appears ONLY in Case 1 (what the child "
-            "says) and Case 3 (the reveal). Refer to the item by its number or order, describe "
-            "the pictured thing by its features, and never translate a hint into an English "
-            "sentence that names the object. Keep every other checkpoint unchanged. Return the "
-            "complete JSON artifact again."
-        )
-        raw_retry, retry_usage = await self._adapter.generate(retry_prompt)
-        merged_usage = {
-            key: usage.get(key, 0) + retry_usage.get(key, 0)
-            for key in set(usage) | set(retry_usage)
-        }
-        try:
-            retry_artifact = _extract_json_from_text(raw_retry)
-        except (ValueError, json.JSONDecodeError) as e:
-            logger.warning("learn_agent.leak_retry_parse_error", lesson_title=lesson_title, error=str(e))
-            return artifact, merged_usage
-
-        retry_leaks = find_checkpoint_answer_leaks(retry_artifact.get("checkpoint_specs") or [])
-        logger.info(
-            "learn_agent.leak_retry_result",
-            feature="ARTIFACT",
-            lesson_title=lesson_title,
-            leaks_before=len(leaks),
-            leaks_after=len(retry_leaks),
-            kept="retry" if len(retry_leaks) < len(leaks) else "original",
-        )
-        if len(retry_leaks) < len(leaks):
-            return retry_artifact, merged_usage
-        return artifact, merged_usage
 
     async def generate_talk_agent_system_task(
         self,

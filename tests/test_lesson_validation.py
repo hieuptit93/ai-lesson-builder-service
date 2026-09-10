@@ -347,7 +347,8 @@ class TestCheckpointAnswerLeaks:
         assert find_checkpoint_answer_leaks(ckps) == []
 
 
-HIDDEN_KEY = "[Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: d → door]"
+HIDDEN_KEY = "[Đáp án ẩn: d → door]"
+LONG_HIDDEN_KEY = "[Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: d → door]"
 
 
 class TestInlineAnswerDlines:
@@ -373,8 +374,14 @@ class TestInlineAnswerDlines:
         plan = self._plan("D3: Bo đoán và điền chữ cái phù hợp nhé: _oy (b), _oor (d).")
         assert find_inline_answer_dlines(plan)[0]["problem"] == "inline_answer"
 
+    def test_long_form_key_is_also_accepted(self):
+        plan = self._plan(
+            f"D2: Mục 1 — hình cái cửa — _oor. Bo đoán chữ cái đầu là gì? Gợi ý 1: vật mình mở ra. Gợi ý 2: bốn chữ cái. {LONG_HIDDEN_KEY}"
+        )
+        assert find_inline_answer_dlines(plan) == []
+
     def test_hidden_key_without_scripted_hints_is_flagged(self):
-        plan = self._plan(f"D2: Mục 1 — hình cái cửa — _oor. Bo đoán chữ cái đầu là gì? {HIDDEN_KEY}")
+        plan = self._plan(f"D2: Mục 1 — hình cái cửa — _oor. Bo đoán chữ cái đầu là gì? {LONG_HIDDEN_KEY}")
         assert find_inline_answer_dlines(plan) == [
             {"lesson_id": "lesson_001", "dline": "D2", "problem": "missing_hints"}
         ]

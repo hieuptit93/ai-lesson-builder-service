@@ -440,12 +440,12 @@ SOURCE FIDELITY CHECK (ALWAYS RUN — HARD FAIL):
   thể từng bước", "dạy qua hình minh hoạ", or "học thêm". A method-only request never exempts
   `lesson_001` from using the source items.
 - ANSWER KEY CHECK (HARD FAIL): for every item D-step, confirm the correct answer is named in the
-  text — inside the bracketed teacher key `[Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói
-  hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: x → word]` that ends the D-step (rule 13b). Count the items
-  that carry such a key. HARD FAIL if that count is lower than `item_count`. A D-step that quotes an
-  item and both of its options without naming which one is correct is INCOMPLETE — rewrite it.
+  text — inside the bracketed teacher key `[Đáp án ẩn: x → word]` that ends the D-step (rule 13b).
+  Count the items that carry such a key. HARD FAIL if that count is lower than `item_count`. A
+  D-step that quotes an item and both of its options without naming which one is correct is
+  INCOMPLETE — rewrite it.
 - HIDDEN KEY FORMAT CHECK (HARD FAIL): every item D-step must read `<câu hỏi> Gợi ý 1: … Gợi ý 2: …
-  [Đáp án — …]`. HARD FAIL if the answer sits right after the question ("Từ _oy là gì? Đáp án: boy",
+  [Đáp án ẩn: …]`. HARD FAIL if the answer sits right after the question ("Từ _oy là gì? Đáp án: boy",
   "_oy (b)", "(đáp án: b → boy)" without the bracketed key) or if Gợi ý 1 / Gợi ý 2 is missing. The
   runtime reads D-steps aloud in order — an inline answer is spoken before the child can try.
 - HARD FAIL if any answer was taken from `student_ink` / `student_marked_answer` / a circled or
@@ -510,9 +510,9 @@ Rules by lesson type:
    - Mỗi D-line có 3 phần, đúng thứ tự và tách rời nhau:
      (1) PHẦN HỎI — điều Pika nói với bé: nhãn hình bằng lời + phần chữ nhìn thấy, chỉ đọc các chữ cái ĐÃ IN, không đọc chữ thiếu, không đánh vần cả từ;
      (2) "Gợi ý 1:" — nghĩa/đặc điểm của vật; "Gợi ý 2:" — đặc điểm thứ hai HOẶC số chữ cái của cả từ ("từ này có bốn chữ cái"). Cả hai gợi ý KHÔNG được chứa: từ đích, chữ cái thiếu, âm của chữ cái ("bờ", "phờ"), từ ví dụ bắt đầu bằng chữ đó ("như bánh bao"), vị trí trong bảng chữ cái, hay danh sách lựa chọn ("b hay m");
-     (3) "[Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: d → door]".
-     Ví dụ: "D3: Mục 13 — hình cánh cửa — chấm chấm oor. Bé đoán chữ cái đầu là gì? Gợi ý 1: vật mình mở ra để vào phòng. Gợi ý 2: từ này có bốn chữ cái. [Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: d → door]".
-     KHÔNG viết "Đáp án là d" ngay trong câu hỏi. KHÔNG để runtime tự giải hay tự nghĩ từ/gợi ý.
+     (3) "[Đáp án ẩn: d → door]" — key cho Pika kiểm tra; runtime đã biết chỉ đọc nó sau khi nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai, nên KHÔNG cần viết thêm giải thích.
+     Ví dụ: "D3: Mục 13 — hình cánh cửa — chấm chấm oor. Bé đoán chữ cái đầu là gì? Gợi ý 1: vật mình mở ra để vào phòng. Gợi ý 2: từ này có bốn chữ cái. [Đáp án ẩn: d → door]".
+     KHÔNG viết "Đáp án là d" ngay trong câu hỏi. KHÔNG để runtime tự giải hay tự nghĩ từ/gợi ý. Viết ngắn gọn: mỗi D-line một dòng, không lặp lại chỉ dẫn.
    - Dùng ĐÚNG cặp hình ↔ từ trong `picture_word_pairs` (nếu IMAGE DESCRIPTION có); không tự ghép lại theo hàng ngang, không đổi thứ tự.
    - Chỉ dạy các mục thuộc CÙNG một bài/phần (cùng SECTION). Mục lẻ của bài kế bên (ví dụ số 12 nằm phía trên tiêu đề Question 7) KHÔNG được kéo vào, trừ khi phụ huynh yêu cầu.
    - Khi phụ huynh không chỉ định bài nào: `lesson_001` là bài tập ĐẦY ĐỦ nhất trong ảnh (có tiêu đề/chỉ dẫn và nhiều mục), không phải mục lẻ/dở của bài trước bị cắt ở mép ảnh. Mục lẻ đó chỉ được dùng cho `lesson_002`/`lesson_003` nếu đủ rõ, hoặc bỏ qua.
@@ -655,9 +655,9 @@ Khi NỘI DUNG AN TOÀN:
   "reason": "",
   "content": "Đã tạo bài học thành công",
   "lessons": [
-    {{ "lesson_id": "lesson_001", "title": "Tên bài học 1 (ngắn gọn, hấp dẫn)", "summary": "Nội dung tóm tắt bài học 1 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ. BẮT BUỘC nếu bài chạm tới thực thể trong VERIFIED FACTS: kết thúc phần hướng dẫn bằng \nSỰ THẬT ĐÃ XÁC MINH — chỉ được nói đúng những dòng này:\n- <các dòng sự thật liên quan>\n rồi mới tới dòng → GOAL:]" }},
-    {{ "lesson_id": "lesson_002", "title": "Tên bài học 2", "summary": "Nội dung tóm tắt bài học 2 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ. BẮT BUỘC nếu bài chạm tới thực thể trong VERIFIED FACTS: kết thúc phần hướng dẫn bằng \nSỰ THẬT ĐÃ XÁC MINH — chỉ được nói đúng những dòng này:\n- <các dòng sự thật liên quan>\n rồi mới tới dòng → GOAL:]" }},
-    {{ "lesson_id": "lesson_003", "title": "Tên bài học 3", "summary": "Nội dung tóm tắt bài học 3 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ. BẮT BUỘC nếu bài chạm tới thực thể trong VERIFIED FACTS: kết thúc phần hướng dẫn bằng \nSỰ THẬT ĐÃ XÁC MINH — chỉ được nói đúng những dòng này:\n- <các dòng sự thật liên quan>\n rồi mới tới dòng → GOAL:]" }}
+    {{ "lesson_id": "lesson_001", "title": "Tên bài học 1 (ngắn gọn, hấp dẫn)", "summary": "Nội dung tóm tắt bài học 1 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ. Với bài tập theo mục, MỖI mục là MỘT dòng D đúng mẫu sau (quy tắc 13b): D2: Mục 13 — hình cánh cửa — chấm chấm oor. Bé đoán chữ cái đầu là gì? Gợi ý 1: vật mình mở ra để vào phòng. Gợi ý 2: từ này có bốn chữ cái. [Đáp án ẩn: d → door] — KHÔNG BAO GIỜ viết 'Đáp án: door' hay '(d)' ngay sau câu hỏi. BẮT BUỘC nếu bài chạm tới thực thể trong VERIFIED FACTS: kết thúc phần hướng dẫn bằng \nSỰ THẬT ĐÃ XÁC MINH — chỉ được nói đúng những dòng này:\n- <các dòng sự thật liên quan>\n rồi mới tới dòng → GOAL:]" }},
+    {{ "lesson_id": "lesson_002", "title": "Tên bài học 2", "summary": "Nội dung tóm tắt bài học 2 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ. Mọi dòng D có mục bài tập/đáp án — kể cả dạng trò chơi — cũng theo mẫu 13b: Gợi ý 1: … Gợi ý 2: … [Đáp án ẩn: …]. BẮT BUỘC nếu bài chạm tới thực thể trong VERIFIED FACTS: kết thúc phần hướng dẫn bằng \nSỰ THẬT ĐÃ XÁC MINH — chỉ được nói đúng những dòng này:\n- <các dòng sự thật liên quan>\n rồi mới tới dòng → GOAL:]" }},
+    {{ "lesson_id": "lesson_003", "title": "Tên bài học 3", "summary": "Nội dung tóm tắt bài học 3 trong 1-2 câu", "detail_tasks_lesson": "Hoạt động 1: [Hoạt động cụ thể 1]\nHoạt động 2: [Hoạt động cụ thể 2]\nHoạt động 3: [Hoạt động cụ thể 3]", "prompt_agent": "[Hướng dẫn chi tiết cho Pika dạy bài học này cho trẻ. Mọi dòng D có mục bài tập/đáp án — kể cả dạng trò chơi — cũng theo mẫu 13b: Gợi ý 1: … Gợi ý 2: … [Đáp án ẩn: …]. BẮT BUỘC nếu bài chạm tới thực thể trong VERIFIED FACTS: kết thúc phần hướng dẫn bằng \nSỰ THẬT ĐÃ XÁC MINH — chỉ được nói đúng những dòng này:\n- <các dòng sự thật liên quan>\n rồi mới tới dòng → GOAL:]" }}
   ]  
 }}
 ```

@@ -897,13 +897,22 @@ class LessonPipeline:
             if not request.image_urls:
                 raise MissingImageUrlsError()
 
-            # Guardrail: Skip if disabled in settings (for trusted sources)
-            guardrail_enabled = self._settings.openai_guardrail_enabled if self._settings else True
+            # The separate guardrail model belongs to the v3 flow only. v1
+            # (use_full_prompt) matches the original service: safety screening
+            # is step 1 of the vision prompt itself, no extra call.
+            guardrail_enabled = (
+                not use_full_prompt
+                and (self._settings.openai_guardrail_enabled if self._settings else True)
+            )
 
             async def run_guardrail() -> str:
                 """Returns rejection reason, or empty string when safe/disabled."""
                 if not guardrail_enabled:
-                    logger.info("guardrail_skipped", request_id=request_id, reason="disabled_in_settings")
+                    logger.info(
+                        "guardrail_skipped",
+                        request_id=request_id,
+                        reason="v1_flow" if use_full_prompt else "disabled_in_settings",
+                    )
                     return ""
                 try:
                     await self._extraction.check_images_safety_v3(request.image_urls)
@@ -918,7 +927,7 @@ class LessonPipeline:
                     subject=subject,
                 )
 
-            # OPTIMISTIC EXECUTION: guardrail starts immediately and overlaps
+            # OPTIMISTIC EXECUTION (v3): guardrail starts immediately and overlaps
             # the (bounded) profile/memory fetch AND the vision stream.
             guardrail_task = asyncio.create_task(run_guardrail())
 

@@ -6,6 +6,7 @@ from app.utils.lesson_validation import (
     count_activities,
     count_d_steps,
     extract_taught_words,
+    find_checkpoint_answer_leaks,
     is_math_lesson,
     is_vocabulary_lesson,
     summarize_reports,
@@ -256,6 +257,72 @@ class TestExtractionHelpers:
     def test_count_activities(self):
         assert count_activities("Hoạt động 1: a\nHoạt động 2: b") == 2
         assert count_activities("") == 0
+
+
+def _spelling_ckp(question: str, hint: str, letter: str = "d", word: str = "door") -> dict:
+    return {
+        "type": "cta",
+        "name": f"Item: {word}",
+        "question": question,
+        "response_guide": (
+            f"• Lần 1 — Case 1 (says the letter '{letter}' or the word '{word}'): Đúng rồi! <next_ckp/>\n"
+            f"• Lần 1 — Case 2 (incorrect or no answer): {hint}\n"
+            f"• Lần 2 — Case 3 (any): Chữ cái đầu là <eng>{letter}</eng>, ghép lại thành <eng>{word}</eng>. <next_ckp/>"
+        ),
+    }
+
+
+class TestCheckpointAnswerLeaks:
+    def test_clean_vietnamese_checkpoint_has_no_leak(self):
+        ckp = _spelling_ckp(
+            "Hình tiếp theo: chấm chấm <eng>o o r</eng>. Chữ cái đầu là gì?",
+            "Gợi ý: đây là vật mình mở ra để vào phòng. Thử lại nhé!",
+        )
+        assert find_checkpoint_answer_leaks([ckp]) == []
+
+    def test_bilingual_echo_naming_the_object_is_a_hint_leak(self):
+        ckp = _spelling_ckp(
+            "Nhìn hình một cái cửa: chấm chấm <eng>o o r</eng>. Chữ cái đầu là gì?",
+            "Gợi ý: đây là vật để mở ra vào phòng. Thử lại nhé! <eng>This is a door. Try again!</eng>",
+        )
+        assert find_checkpoint_answer_leaks([ckp]) == [
+            {"checkpoint": "Item: door", "field": "hint", "word": "door"}
+        ]
+
+    def test_english_question_naming_the_object_is_a_question_leak(self):
+        ckp = _spelling_ckp(
+            "<eng>Look at the picture of a door: _oor. What is the first letter?</eng>",
+            "<eng>Here's a hint: something you open to go into a room. Try again!</eng>",
+        )
+        leaks = find_checkpoint_answer_leaks([ckp])
+        assert [(l["field"], l["word"]) for l in leaks] == [("question", "door")]
+
+    def test_given_letters_and_single_letter_answer_are_not_leaks(self):
+        ckp = _spelling_ckp(
+            "Chấm chấm <eng>o o r</eng>. Chữ cái đầu là chữ gì?",
+            "Gợi ý: chữ này cũng mở đầu từ <eng>duck</eng>. Thử lại nhé!",
+        )
+        assert find_checkpoint_answer_leaks([ckp]) == []
+
+    def test_multiple_choice_question_listing_options_is_not_flagged(self):
+        ckp = {
+            "type": "cta",
+            "name": "Exercise 1",
+            "question": "<eng>_______ she like apples?</eng> Chọn: <eng>Do, Does, Did,</eng> hay <eng>Are?</eng>",
+            "response_guide": (
+                "• Lần 1 — Case 1 (says 'Does'): Đúng rồi! <next_ckp/>\n"
+                "• Lần 1 — Case 2 (incorrect): Gợi ý: chủ ngữ 'she' là ngôi thứ ba số ít. Thử lại nhé!\n"
+                "• Lần 2 — Case 3 (any): Đáp án là 'Does'. <next_ckp/>"
+            ),
+        }
+        assert find_checkpoint_answer_leaks([ckp]) == []
+
+    def test_narratives_and_missing_guides_are_skipped(self):
+        ckps = [
+            {"type": "narrative", "name": "Intro", "question": "door door door", "response_guide": None},
+            {"type": "cta", "name": "No guide", "question": "door", "response_guide": None},
+        ]
+        assert find_checkpoint_answer_leaks(ckps) == []
 
 
 class TestBatchValidation:

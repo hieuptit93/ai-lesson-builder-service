@@ -414,3 +414,63 @@ def summarize_reports(reports: list[ValidationReport]) -> dict:
         "warning_codes": sorted(set(warning_codes)),
         "all_valid": not error_codes,
     }
+
+
+# --- learn-agent checkpoint answer leaks --------------------------------------
+# The learn-agent prompt puts the answer only in response_guide Case 1 (correct)
+# and Case 3 (reveal). Case 1 quotes what the child must say - "says the letter
+# 'd' or the word 'door'" - so those quoted tokens are the answer set. A leak is
+# that word appearing in the question or in the Case 2 hint before the reveal.
+_CASE_RE = re.compile(r"Case\s*(\d)", re.IGNORECASE)
+_ANSWER_TOKEN_RE = re.compile(r"['\"‘“]([A-Za-z][A-Za-z'\-]*)['\"’”]")
+# A question that lists options ("Chọn: Do, Does, Did hay Are?", "He/She/It")
+# legitimately contains the answer; only option-free questions are checked.
+# Runtime tags (<eng>…</eng>) are stripped first so their "/" is not read as a
+# slash-option list.
+_QUESTION_CHOICE_RE = re.compile(r"\bchọn\b|\bchoose\b|\bhay\b|\bor\b|[A-Za-z]\s*/\s*[A-Za-z]", re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+_MIN_ANSWER_WORD_LEN = 3  # single given letters ("chấm chấm o o r") are not leaks
+
+
+def _response_guide_cases(response_guide: str) -> dict[int, str]:
+    cases: dict[int, str] = {}
+    for line in response_guide.splitlines():
+        match = _CASE_RE.search(line)
+        if match:
+            case = int(match.group(1))
+            cases[case] = f"{cases.get(case, '')}\n{line}" if case in cases else line
+    return cases
+
+
+def find_checkpoint_answer_leaks(checkpoint_specs: Iterable[dict]) -> list[dict]:
+    """Return one entry per answer word spoken before the reveal case.
+
+    Entries: {"checkpoint": name, "field": "question" | "hint", "word": w}.
+    Pure and dependency-free so the generator can gate a retry on it.
+    """
+    leaks: list[dict] = []
+    for checkpoint in checkpoint_specs:
+        if not isinstance(checkpoint, dict) or checkpoint.get("type") == "narrative":
+            continue
+        response_guide = checkpoint.get("response_guide")
+        if not isinstance(response_guide, str):
+            continue
+        cases = _response_guide_cases(response_guide)
+        answers = {
+            token.lower()
+            for token in _ANSWER_TOKEN_RE.findall(cases.get(1, ""))
+            if len(token) >= _MIN_ANSWER_WORD_LEN
+        }
+        if not answers:
+            continue
+
+        name = str(checkpoint.get("name") or "")
+        question = str(checkpoint.get("question") or "")
+        targets = [("hint", cases.get(2, ""))]
+        if not _QUESTION_CHOICE_RE.search(_TAG_RE.sub(" ", question)):
+            targets.append(("question", question))
+        for field_name, text in targets:
+            for word in sorted(answers):
+                if re.search(rf"\b{re.escape(word)}\b", text, re.IGNORECASE):
+                    leaks.append({"checkpoint": name, "field": field_name, "word": word})
+    return leaks

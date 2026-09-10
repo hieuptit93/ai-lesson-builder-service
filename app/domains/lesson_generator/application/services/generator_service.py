@@ -21,6 +21,7 @@ from app.domains.lesson_generator.application.services.prompt_builder import (
     build_talk_agent_system_task_prompt,
 )
 from app.domains.lesson_generator.infrastructure.openai_lesson_adapter import OpenAILessonAdapter
+from app.utils.lesson_validation import find_checkpoint_answer_leaks
 
 logger = structlog.get_logger()
 
@@ -504,7 +505,75 @@ class GeneratorService:
             )
             raise
 
+        leaks = find_checkpoint_answer_leaks(artifact.get("checkpoint_specs") or [])
+        if leaks:
+            artifact, usage = await self._regenerate_without_leaks(
+                prompt, artifact, usage, leaks, lesson_title=lesson_title, template_id=template_id
+            )
+
         return artifact, usage
+
+    async def _regenerate_without_leaks(
+        self,
+        prompt: str,
+        artifact: dict,
+        usage: dict,
+        leaks: list[dict],
+        *,
+        lesson_title: str,
+        template_id: str | None,
+    ) -> tuple[dict, dict]:
+        """One corrective pass when a checkpoint speaks the answer before the reveal.
+
+        English/bilingual output leaks most often ("This is a door. Try again!"),
+        and the leak is invisible to the runtime, so it is cheaper to spend one
+        extra call here than to ship it. Keeps whichever result leaks less.
+        """
+        logger.warning(
+            "learn_agent.answer_leak_detected",
+            feature="ARTIFACT",
+            lesson_title=lesson_title,
+            template_id=template_id,
+            leak_count=len(leaks),
+            leaks=leaks[:10],
+        )
+        offending = "\n".join(
+            f"- checkpoint \"{leak['checkpoint']}\": the {leak['field']} says \"{leak['word']}\", "
+            f"which is the answer of that checkpoint"
+            for leak in leaks
+        )
+        retry_prompt = (
+            f"{prompt}\n\n## ANSWER LEAK DETECTED — REGENERATE THE WHOLE JSON\n"
+            f"Your previous output spoke the answer before the reveal case:\n{offending}\n"
+            "Rewrite those checkpoints so the target word appears ONLY in Case 1 (what the child "
+            "says) and Case 3 (the reveal). Refer to the item by its number or order, describe "
+            "the pictured thing by its features, and never translate a hint into an English "
+            "sentence that names the object. Keep every other checkpoint unchanged. Return the "
+            "complete JSON artifact again."
+        )
+        raw_retry, retry_usage = await self._adapter.generate(retry_prompt)
+        merged_usage = {
+            key: usage.get(key, 0) + retry_usage.get(key, 0)
+            for key in set(usage) | set(retry_usage)
+        }
+        try:
+            retry_artifact = _extract_json_from_text(raw_retry)
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.warning("learn_agent.leak_retry_parse_error", lesson_title=lesson_title, error=str(e))
+            return artifact, merged_usage
+
+        retry_leaks = find_checkpoint_answer_leaks(retry_artifact.get("checkpoint_specs") or [])
+        logger.info(
+            "learn_agent.leak_retry_result",
+            feature="ARTIFACT",
+            lesson_title=lesson_title,
+            leaks_before=len(leaks),
+            leaks_after=len(retry_leaks),
+            kept="retry" if len(retry_leaks) < len(leaks) else "original",
+        )
+        if len(retry_leaks) < len(leaks):
+            return retry_artifact, merged_usage
+        return artifact, merged_usage
 
     async def generate_talk_agent_system_task(
         self,

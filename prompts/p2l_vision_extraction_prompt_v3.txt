@@ -175,6 +175,8 @@ The visual exists in the images and the model CAN see it. The content is recover
 
 Action: **Keep the lesson.** In the content field, include a concise factual description of the relevant visual content — what objects, people, text, labels, or information are shown — so that the lesson can be understood without seeing the original image. Combine this description with the exercise instructions.
 
+Picture-item pairing (MANDATORY for label-the-picture / write-the-letter / match-pictures-with-words items): write each item as ONE line that keeps the picture label and the item's visible text together — `13. [picture: a door] → _oor`. Never emit the pictures as one list and the words/blanks as a second list; the downstream teacher cannot re-pair them reliably. When pictures and words sit in different columns joined by crossing lines, pair each picture with the only visible word/blank it completes (semantic match), not with the word printed on the same row. If a picture cannot be identified, write `[picture: unclear]` and keep its blank exactly as printed — never guess. Keep the worked example (marked `Example:`) as its own line so the teacher can present it before quizzing, and keep items in their printed order.
+
 Exception: If the exercise only instructs the student to interact with a visual but the answer or learning objective is entirely determined by text already on the page (labels, captions, answer choices), the visual description is not needed — extract the text content as normal.
 
 #### Case 3 — The source material is a text, story, or passage in the same image set

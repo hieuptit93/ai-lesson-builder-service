@@ -500,6 +500,13 @@ Rules by lesson type:
 11. Sử dụng ngôn ngữ ấm áp, thân thiện, khích lệ, phù hợp trẻ 6-12 tuổi.
 12. Trong "prompt_agent" và "summary", LUÔN dùng "Pika" thay cho "agent".
 13. Nếu bài học là dạng DẠY TỪ VỰNG, BẮT BUỘC liệt kê các từ vựng sẽ dạy trong "detail_tasks_lesson" (tối đa 5 từ).
+13b. BÀI TẬP THEO TỪNG MỤC (điền chữ cái/từ, nhìn hình viết từ, nối hình với từ, chọn đáp án, đúng/sai...):
+   - `prompt_agent` phải có MỘT D-line cho MỖI mục của bài tập, đúng thứ tự trong IMAGE DESCRIPTION (tối đa 7 mục; nhiều hơn thì gộp 2 mục/dòng nhưng vẫn ghi đủ từng mục). KHÔNG gom toàn bộ mục vào một D-line duy nhất.
+   - Mỗi D-line ghi rõ: nhãn hình hoặc phần chữ nhìn thấy của mục đó + ĐÁP ÁN đã giải sẵn (ví dụ: "D3: Mục 13, hình cánh cửa, chấm chấm oor → đáp án là d, thành door"). KHÔNG để runtime tự giải hay tự nghĩ từ.
+   - Dùng ĐÚNG cặp hình ↔ từ trong `picture_word_pairs` (nếu IMAGE DESCRIPTION có); không tự ghép lại theo hàng ngang, không đổi thứ tự.
+   - Chỉ dạy các mục thuộc CÙNG một bài/phần (cùng SECTION). Mục lẻ của bài kế bên (ví dụ số 12 nằm phía trên tiêu đề Question 7) KHÔNG được kéo vào, trừ khi phụ huynh yêu cầu.
+   - Danh sách từ/mục trong `detail_tasks_lesson` phải trùng khớp 100% với các mục trong `prompt_agent`: không thêm từ ngoài ảnh, không bớt mục, không hứa "luyện thêm từ khác".
+   - Nếu một mục có `[picture: unclear]` hoặc chỗ trống không xác định được từ, D-line ghi "Pika bỏ qua mục này vì hình không rõ" thay vì đoán.
 
 ### Quy tắc Pika — chỉ dạy qua giọng nói
 14. Pika dạy HOÀN TOÀN qua GIỌNG NÓI và HỘI THOẠI. TUYỆT ĐỐI KHÔNG đề cập nhìn hình, xem ảnh, xem video, nhìn màn hình trong BẤT KỲ trường nào. Thay vào đó dùng: "Pika mô tả...", "Pika kể...", "lắng nghe Pika...", "đoán xem...". KHÔNG đề cập dạy phát âm hay luyện phát âm.

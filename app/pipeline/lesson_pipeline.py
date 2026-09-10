@@ -101,6 +101,11 @@ def _transform_lesson_plan(
     # user_profile_prompt has no bundled copy on purpose: it is a tiny format
     # string owned by the code, not prose worth managing in Langfuse.
     user_profile_template = get_langfuse_prompt("user_profile_prompt")
+    if user_profile_template is not None and "{child_name}" not in user_profile_template:
+        # A Langfuse edit once replaced this template with a stray test string,
+        # which then rode along verbatim at the end of every finally_prompt_agent.
+        logger.warning("user_profile_prompt.invalid_template", preview=user_profile_template[:40])
+        user_profile_template = None
     if user_profile_template is None:
         user_profile_template = USER_PROFILE_PROMPT_TEMPLATE
 
@@ -561,7 +566,7 @@ class LessonPipeline:
                 "is_mock_data": is_mock_data,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "expert_discussion_log": expert_log,
-                "vision_extracted_text": lesson_plan.get("content", ""),  # From 5-expert extraction
+                "vision_extracted_text": vision_raw_text or "",
                 "usage": token_usage,
                 "cost_usd": cost_usd,
                 "cached_tokens": token_usage.get("cached_tokens", 0),

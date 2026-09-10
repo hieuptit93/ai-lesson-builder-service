@@ -28,7 +28,7 @@ Then STOP. Do not proceed to Step 2.
 
 Your output feeds a downstream lesson generator that handles ALL pedagogy itself.
 - Output ONLY the blocks defined below, in this order: SAFE marker → EXACT_VISIBLE_TEXT_LINES (and EXACT_PASSAGE_TEXT / READING_COMPREHENSION_QUESTIONS when applicable) → SECTION blocks → SUMMARY.
-- Do NOT write prose descriptions, teaching suggestions, activity ideas, lesson-plan guidance, or difficulty analysis paragraphs. The generator ignores them; they only slow the response.
+- Do NOT write prose descriptions, teaching suggestions, activity ideas, lesson-plan guidance, or difficulty analysis paragraphs. The generator ignores them; they only slow the response. The ONE exception is the short factual picture label required by the Picture-Based Item Rule below — that label is data the generator needs, not prose.
 - Do NOT repeat the same text twice. SECTION `content:` lists exercise items exactly once; do not add a separate `visible_text` list that re-quotes the same lines.
 - This output is used by a VOICE-ONLY robot: never suggest looking at images/screens (you should not be suggesting activities at all).
 
@@ -91,6 +91,20 @@ Rules:
 - For sections labeled `I.` / `II.` / `Phần 1` / `Câu 4`: list every visible item under that section.
 - Vocabulary/word-bank sections: preserve ALL visible word-bank terms and numbered items. Do not truncate to 5.
 - A poster/chart with NO numbered exercises needs only ONE minimal SECTION (section_id, section_title, source_type, page fields, unreadable_text, confidence, student_ink, items_with_ink) — do NOT re-quote its text, it is already in EXACT_VISIBLE_TEXT_LINES.
+
+### Picture-Based Item Rule (MANDATORY when an item's answer depends on a picture)
+
+Applies to: label the picture, look and write, write the (first) letter, write the word for the picture, match pictures with words/letters, circle the word for the picture, count the objects — any item where a drawing/photo stands in for the text the student must produce.
+
+- Every SECTION `content:` line for such an item MUST carry a short factual picture label in square brackets right after the item number, followed by that item's visible text: `- "13. [picture: a door] _oor"`. Never output a bare `- "13 _oor"` or `- "13"` — an item line without its picture label is unusable downstream.
+- The label names only what is plainly drawn (object / animal / person / action / count). No colours, moods, teaching hints, and no guess at hidden text.
+- If the picture cannot be identified, write `[picture: unclear]` — never infer the word from the blank next to it.
+- Matching layouts (pictures in one column, words/blanks in another, joined by lines that cross): do NOT pair by row position. Add one `picture_word_pairs:` block to that SECTION listing each picture with the ONLY visible word/blank it completes, in picture order:
+  picture_word_pairs:
+  - "[picture: a boy] → _oy (example)"
+  - "[picture: a door] → _oor"
+  Pair a picture only when exactly one visible word/blank fits it; otherwise write `→ unclear`. The `content:` lines still quote every blank exactly as printed.
+- `item_count` counts picture items exactly like text items. A partially visible item from a neighbouring exercise (e.g. a stray number above this heading) belongs in its own SECTION — never merge it into this one.
 
 ### Page / Side / Section Mapping Rule
 

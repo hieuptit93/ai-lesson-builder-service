@@ -7,6 +7,7 @@ from app.utils.lesson_validation import (
     count_d_steps,
     extract_taught_words,
     find_checkpoint_answer_leaks,
+    find_inline_answer_dlines,
     is_math_lesson,
     is_vocabulary_lesson,
     summarize_reports,
@@ -344,6 +345,43 @@ class TestCheckpointAnswerLeaks:
             {"type": "cta", "name": "No guide", "question": "door", "response_guide": None},
         ]
         assert find_checkpoint_answer_leaks(ckps) == []
+
+
+HIDDEN_KEY = "[Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: d → door]"
+
+
+class TestInlineAnswerDlines:
+    def _plan(self, prompt_agent: str) -> dict:
+        return {"lessons": [{"lesson_id": "lesson_001", "prompt_agent": prompt_agent}]}
+
+    def test_compliant_hidden_key_format_passes(self):
+        plan = self._plan(
+            "D1: Chào Bo!\n"
+            f"D2: Mục 1 — hình cái cửa — chấm chấm o o r. Bo đoán chữ cái đầu là gì? Gợi ý 1: vật mình mở ra để vào phòng. Gợi ý 2: từ này có bốn chữ cái. {HIDDEN_KEY}\n"
+            "→ GOAL: Bo điền đúng."
+        )
+        assert find_inline_answer_dlines(plan) == []
+
+    def test_answer_right_after_question_is_flagged(self):
+        plan = self._plan("D3: Pika hỏi: 'Từ _oy là gì? Đáp án: boy.'\nD4: Tiếp tục: 'Từ _oor là gì? Đáp án: door.'")
+        assert [(p["dline"], p["problem"]) for p in find_inline_answer_dlines(plan)] == [
+            ("D3", "inline_answer"),
+            ("D4", "inline_answer"),
+        ]
+
+    def test_parenthesised_letter_is_flagged(self):
+        plan = self._plan("D3: Bo đoán và điền chữ cái phù hợp nhé: _oy (b), _oor (d).")
+        assert find_inline_answer_dlines(plan)[0]["problem"] == "inline_answer"
+
+    def test_hidden_key_without_scripted_hints_is_flagged(self):
+        plan = self._plan(f"D2: Mục 1 — hình cái cửa — _oor. Bo đoán chữ cái đầu là gì? {HIDDEN_KEY}")
+        assert find_inline_answer_dlines(plan) == [
+            {"lesson_id": "lesson_001", "dline": "D2", "problem": "missing_hints"}
+        ]
+
+    def test_non_item_dlines_are_ignored(self):
+        plan = self._plan("D1: Chào Bo! Hôm nay mình luyện điền chữ cái đầu.\nD7: Pika khen Bo.\n→ GOAL: xong.")
+        assert find_inline_answer_dlines(plan) == []
 
 
 class TestBatchValidation:

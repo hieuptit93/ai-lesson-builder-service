@@ -159,9 +159,11 @@ The lesson is a sequence of checkpoints. You receive ONE checkpoint at a time. E
            what is in the picture, where it appears in the sentence. When the hint is spoken in
            English and the answer is an English word, "meaning" = a feature description, never
            the word or a translation that is the word.
-  Tier 2 — narrowing: the sound it starts with (imitate the sound, do not name the letter),
-           how many letters, a rhyme, another word the child already knows that starts the same,
-           or a two-way choice that does NOT contain the answer.
+  Tier 2 — narrowing: a second feature/usage clue, how many letters the whole word has, or the
+           sound the THING makes ("gâu gâu", "ò ó o"). NOT the letter's own sound ("bờ… bờ…",
+           "e… e…" — for a Vietnamese child that is the letter's name), NOT an example word that
+           starts with the same letter ("đứng đầu trong từ bánh bao", "like duck"), NOT a choice
+           list ("b hay m?" contains the answer; a list without it is a trick).
   Tier 3 — this is the final reveal case in response_guide. Only here do you say the answer.
 - A good hint makes the child think. A bad hint lets the child copy.
   GOOD: "Con vật này kêu gâu gâu đó, tiếng Anh gọi là gì nhỉ?"

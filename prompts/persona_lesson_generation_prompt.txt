@@ -440,9 +440,14 @@ SOURCE FIDELITY CHECK (ALWAYS RUN — HARD FAIL):
   thể từng bước", "dạy qua hình minh hoạ", or "học thêm". A method-only request never exempts
   `lesson_001` from using the source items.
 - ANSWER KEY CHECK (HARD FAIL): for every item D-step, confirm the correct answer is named in the
-  text. Count the items that carry an explicit answer. HARD FAIL if that count is lower than
-  `item_count`. A D-step that quotes an item and both of its options without naming which one is
-  correct is INCOMPLETE — rewrite it.
+  text — inside the bracketed teacher key `[Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói
+  hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: x → word]` that ends the D-step (rule 13b). Count the items
+  that carry such a key. HARD FAIL if that count is lower than `item_count`. A D-step that quotes an
+  item and both of its options without naming which one is correct is INCOMPLETE — rewrite it.
+- HIDDEN KEY FORMAT CHECK (HARD FAIL): every item D-step must read `<câu hỏi> Gợi ý 1: … Gợi ý 2: …
+  [Đáp án — …]`. HARD FAIL if the answer sits right after the question ("Từ _oy là gì? Đáp án: boy",
+  "_oy (b)", "(đáp án: b → boy)" without the bracketed key) or if Gợi ý 1 / Gợi ý 2 is missing. The
+  runtime reads D-steps aloud in order — an inline answer is spoken before the child can try.
 - HARD FAIL if any answer was taken from `student_ink` / `student_marked_answer` / a circled or
   ticked option instead of being derived from the language of the item itself.
 - For adjective/adverb choice items, re-check each one against the linking-verb rule before printing
@@ -502,9 +507,15 @@ Rules by lesson type:
 13. Nếu bài học là dạng DẠY TỪ VỰNG, BẮT BUỘC liệt kê các từ vựng sẽ dạy trong "detail_tasks_lesson" (tối đa 5 từ).
 13b. BÀI TẬP THEO TỪNG MỤC (điền chữ cái/từ, nhìn hình viết từ, nối hình với từ, chọn đáp án, đúng/sai...):
    - `prompt_agent` phải có MỘT D-line cho MỖI mục của bài tập, đúng thứ tự trong IMAGE DESCRIPTION (tối đa 7 mục; nhiều hơn thì gộp 2 mục/dòng nhưng vẫn ghi đủ từng mục). KHÔNG gom toàn bộ mục vào một D-line duy nhất.
-   - Mỗi D-line ghi rõ: nhãn hình hoặc phần chữ nhìn thấy của mục đó + ĐÁP ÁN đã giải sẵn (ví dụ: "D3: Mục 13, hình cánh cửa, chấm chấm oor → đáp án là d, thành door"). KHÔNG để runtime tự giải hay tự nghĩ từ.
+   - Mỗi D-line có 3 phần, đúng thứ tự và tách rời nhau:
+     (1) PHẦN HỎI — điều Pika nói với bé: nhãn hình bằng lời + phần chữ nhìn thấy, chỉ đọc các chữ cái ĐÃ IN, không đọc chữ thiếu, không đánh vần cả từ;
+     (2) "Gợi ý 1:" — nghĩa/đặc điểm của vật; "Gợi ý 2:" — đặc điểm thứ hai HOẶC số chữ cái của cả từ ("từ này có bốn chữ cái"). Cả hai gợi ý KHÔNG được chứa: từ đích, chữ cái thiếu, âm của chữ cái ("bờ", "phờ"), từ ví dụ bắt đầu bằng chữ đó ("như bánh bao"), vị trí trong bảng chữ cái, hay danh sách lựa chọn ("b hay m");
+     (3) "[Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: d → door]".
+     Ví dụ: "D3: Mục 13 — hình cánh cửa — chấm chấm oor. Bé đoán chữ cái đầu là gì? Gợi ý 1: vật mình mở ra để vào phòng. Gợi ý 2: từ này có bốn chữ cái. [Đáp án — chỉ để Pika kiểm tra, chỉ đọc sau khi đã nói hết Gợi ý 1 và Gợi ý 2 mà bé vẫn sai: d → door]".
+     KHÔNG viết "Đáp án là d" ngay trong câu hỏi. KHÔNG để runtime tự giải hay tự nghĩ từ/gợi ý.
    - Dùng ĐÚNG cặp hình ↔ từ trong `picture_word_pairs` (nếu IMAGE DESCRIPTION có); không tự ghép lại theo hàng ngang, không đổi thứ tự.
    - Chỉ dạy các mục thuộc CÙNG một bài/phần (cùng SECTION). Mục lẻ của bài kế bên (ví dụ số 12 nằm phía trên tiêu đề Question 7) KHÔNG được kéo vào, trừ khi phụ huynh yêu cầu.
+   - Khi phụ huynh không chỉ định bài nào: `lesson_001` là bài tập ĐẦY ĐỦ nhất trong ảnh (có tiêu đề/chỉ dẫn và nhiều mục), không phải mục lẻ/dở của bài trước bị cắt ở mép ảnh. Mục lẻ đó chỉ được dùng cho `lesson_002`/`lesson_003` nếu đủ rõ, hoặc bỏ qua.
    - Danh sách từ/mục trong `detail_tasks_lesson` phải trùng khớp 100% với các mục trong `prompt_agent`: không thêm từ ngoài ảnh, không bớt mục, không hứa "luyện thêm từ khác".
    - Nếu một mục có `[picture: unclear]` hoặc chỗ trống không xác định được từ, D-line ghi "Pika bỏ qua mục này vì hình không rõ" thay vì đoán.
 

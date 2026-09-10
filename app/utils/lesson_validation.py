@@ -416,6 +416,51 @@ def summarize_reports(reports: list[ValidationReport]) -> dict:
     }
 
 
+# --- v1 exercise plans: answer must be a hidden teacher key --------------------
+# Rule 13b of the generation prompt: an item D-line reads
+#   <question> Gợi ý 1: … Gợi ý 2: … [Đáp án — chỉ để Pika kiểm tra…: d → door]
+# The runtime reads D-lines aloud in order, so "Từ _oy là gì? Đáp án: boy" or
+# "_oy (b)" speaks the answer before the child can try.
+_ITEM_DLINE_RE = re.compile(
+    r"_\s*[A-Za-z]{2,}|chấm (?:chấm|dưới|trống)|chỗ trống|gạch dưới|Đáp án|Gợi ý 1",
+    re.IGNORECASE,
+)
+_HIDDEN_KEY_RE = re.compile(r"\[Đáp án")
+_INLINE_ANSWER_RE = re.compile(
+    r"(?<!\[)Đáp án\s*[:\-–—]?\s*(?:là\s*)?['\"“]?[A-Za-z]"  # "Đáp án: b", "Đáp án là 'boy'"
+    r"|\(\s*(?:đáp án\s*:?\s*)?[A-Za-z]\s*(?:→[^)]*)?\)",     # "_oy (b)", "(đáp án: b → boy)"
+    re.IGNORECASE,
+)
+
+
+def find_inline_answer_dlines(lesson_plan: dict) -> list[dict]:
+    """Item D-lines that speak the answer or lack the scripted hints.
+
+    Entries: {"lesson_id": id, "dline": "D3", "problem": "inline_answer" | "missing_hints"}.
+    """
+    problems: list[dict] = []
+    for index, lesson in enumerate(lesson_plan.get("lessons") or [], start=1):
+        if not isinstance(lesson, dict):
+            continue
+        lesson_id = str(lesson.get("lesson_id") or f"lesson_{index:03d}")
+        for line in str(lesson.get("prompt_agent") or "").splitlines():
+            match = re.match(r"\s*(D\d+)\s*:", line)
+            if not match or not _ITEM_DLINE_RE.search(line):
+                continue
+            # The hidden key's own wording mentions "Gợi ý 1 và Gợi ý 2", so the
+            # hint check must look only at the spoken part before the bracket.
+            outside_key = _HIDDEN_KEY_RE.split(line, maxsplit=1)[0]
+            if _INLINE_ANSWER_RE.search(outside_key):
+                problems.append({"lesson_id": lesson_id, "dline": match.group(1), "problem": "inline_answer"})
+            elif (
+                "Gợi ý 1" not in outside_key
+                or "Gợi ý 2" not in outside_key
+                or not _HIDDEN_KEY_RE.search(line)
+            ):
+                problems.append({"lesson_id": lesson_id, "dline": match.group(1), "problem": "missing_hints"})
+    return problems
+
+
 # --- learn-agent checkpoint answer leaks --------------------------------------
 # The learn-agent prompt puts the answer only in response_guide Case 1 (correct)
 # and Case 3 (reveal). Case 1 quotes what the child must say - "says the letter

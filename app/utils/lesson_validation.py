@@ -429,6 +429,16 @@ _ANSWER_TOKEN_RE = re.compile(r"['\"‘“]([A-Za-z][A-Za-z'\-]*)['\"’”]")
 # slash-option list.
 _QUESTION_CHOICE_RE = re.compile(r"\bchọn\b|\bchoose\b|\bhay\b|\bor\b|[A-Za-z]\s*/\s*[A-Za-z]", re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
+# "e, l, e, p, h, a, n, t" / "e-l-e-p-h-a-n-t" / "e l e p h a n t": a run of
+# single letters separated by spaces or punctuation is the word spelled aloud.
+_SPELLED_RUN_RE = re.compile(r"(?<![A-Za-z])(?:[A-Za-z][\s,\-–.]+){2,}[A-Za-z](?![A-Za-z])")
+
+
+def _spelled_words(text: str) -> set[str]:
+    return {
+        "".join(re.findall(r"[A-Za-z]", run.group(0))).lower()
+        for run in _SPELLED_RUN_RE.finditer(text)
+    }
 _MIN_ANSWER_WORD_LEN = 3  # single given letters ("chấm chấm o o r") are not leaks
 
 
@@ -470,7 +480,9 @@ def find_checkpoint_answer_leaks(checkpoint_specs: Iterable[dict]) -> list[dict]
         if not _QUESTION_CHOICE_RE.search(_TAG_RE.sub(" ", question)):
             targets.append(("question", question))
         for field_name, text in targets:
+            plain = _TAG_RE.sub(" ", text)
+            spelled = _spelled_words(plain)
             for word in sorted(answers):
-                if re.search(rf"\b{re.escape(word)}\b", text, re.IGNORECASE):
+                if re.search(rf"\b{re.escape(word)}\b", plain, re.IGNORECASE) or word in spelled:
                     leaks.append({"checkpoint": name, "field": field_name, "word": word})
     return leaks

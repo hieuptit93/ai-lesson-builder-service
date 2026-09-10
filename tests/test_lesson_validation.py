@@ -297,6 +297,27 @@ class TestCheckpointAnswerLeaks:
         leaks = find_checkpoint_answer_leaks([ckp])
         assert [(l["field"], l["word"]) for l in leaks] == [("question", "door")]
 
+    def test_spelling_the_whole_word_letter_by_letter_is_a_leak(self):
+        ckp = _spelling_ckp(
+            "Hình con voi: chấm chấm <eng>l e p h a n t</eng>. Nếu đánh vần, sẽ là "
+            "<eng>e, l, e, p, h, a, n, t</eng>. Chữ cái đầu là gì?",
+            "Gợi ý: con vật to có vòi dài. Thử lại nhé!",
+            letter="e",
+            word="elephant",
+        )
+        assert find_checkpoint_answer_leaks([ckp]) == [
+            {"checkpoint": "Item: elephant", "field": "question", "word": "elephant"}
+        ]
+
+    def test_reading_only_the_printed_letters_is_not_a_leak(self):
+        ckp = _spelling_ckp(
+            "Hình con voi: chấm chấm <eng>l e p h a n t</eng>. Chữ cái đầu là gì?",
+            "Gợi ý: con vật to có vòi dài. <eng>Try again!</eng>",
+            letter="e",
+            word="elephant",
+        )
+        assert find_checkpoint_answer_leaks([ckp]) == []
+
     def test_given_letters_and_single_letter_answer_are_not_leaks(self):
         ckp = _spelling_ckp(
             "Chấm chấm <eng>o o r</eng>. Chữ cái đầu là chữ gì?",
